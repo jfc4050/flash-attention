@@ -36,6 +36,7 @@ than CUDA forward + backward.
 
 import math
 
+import numpy as np
 import torch
 
 import triton
@@ -63,6 +64,9 @@ def _fwd_kernel(
     Q, K, V, Bias, Out,
     Lse, TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     softmax_scale,
+    dropout_p: float,
+    dropout_seed: int,
+    dropout_seq_offset: int,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -70,6 +74,7 @@ def _fwd_kernel(
     stride_ob, stride_oh, stride_om,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
+    USE_DROPOUT: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -167,6 +172,17 @@ def _fwd_kernel(
             m_ij = tl.maximum(tl.max(qk, 1) * softmax_scale, lse_i)
             p = tl.exp(qk * softmax_scale - m_ij[:, None])
         l_ij = tl.sum(p, 1)
+
+        # apply dropout
+        if USE_DROPOUT:
+            # attn matrix has shape (B * H, seqlen_q, seqlen_kv)
+            rng_offsets = \
+                dropout_seq_offset + \
+                (off_hb * seqlen_q * seqlen_k) + \
+                (offs_m[:, None] * seqlen_k) + \
+                (start_n + offs_n[None, :])
+            keep_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
+            p = tl.where(keep_mask, p / (1 - dropout_p), 0.0)
 
         # scale acc_o
         acc_o_scale = tl.exp(m_i - m_ij)
@@ -280,9 +296,14 @@ def _bwd_kernel_one_col_block(
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
+    dropout_p: float,
+    dropout_seed: int,
+    dropout_seq_offset: int,
+    offs_hb,
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
     seqlen_q, seqlen_k, headdim,
+    USE_DROPOUT: tl.constexpr,
     ATOMIC_ADD: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
@@ -387,6 +408,23 @@ def _bwd_kernel_one_col_block(
             p = tl.exp(qk * softmax_scale - lse_i[:, None])
         else:
             p = tl.exp(qk - lse_i[:, None])
+
+        zij = tl.zeros([BLOCK_M, BLOCK_N], dtype=p.dtype)
+        if USE_DROPOUT:
+            # compute Zij. has values:
+            #   1 / (1 - p) with probability 1 - p
+            #   0 with probability p
+            rng_offsets = \
+                dropout_seq_offset + \
+                offs_hb * seqlen_q * seqlen_k + \
+                (start_m + offs_m[:, None] * seqlen_k) + \
+                (start_n + offs_n[None, :])
+            dropout_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
+            zij = dropout_mask.to(p.dtype) / (1 - dropout_p)
+
+            # apply dropout to Pij
+            p *= zij
+
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
@@ -417,6 +455,7 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        dp *= zij
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
@@ -504,6 +543,9 @@ def _bwd_kernel(
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
+    dropout_p: float,
+    dropout_seed: int,
+    dropout_seq_offset: int,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -514,6 +556,7 @@ def _bwd_kernel(
     stride_dvb, stride_dvh, stride_dvn,
     nheads, seqlen_q, seqlen_k, seqlen_q_rounded, headdim,
     CACHE_KEY_SEQLEN_Q, CACHE_KEY_SEQLEN_K,
+    USE_DROPOUT: tl.constexpr,
     BIAS_TYPE: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     BLOCK_HEADDIM: tl.constexpr,
@@ -546,9 +589,14 @@ def _bwd_kernel(
                 DO, DQ, DK, DV,
                 LSE, D,
                 softmax_scale,
+                dropout_p,
+                dropout_seed,
+                dropout_seq_offset,
+                off_hb,
                 stride_qm, stride_kn, stride_vn, stride_bm,
                 stride_dom, stride_dqm, stride_dkn, stride_dvn,
                 seqlen_q, seqlen_k, headdim,
+                USE_DROPOUT=USE_DROPOUT,
                 ATOMIC_ADD=False,
                 BIAS_TYPE=BIAS_TYPE,
                 IS_CAUSAL=IS_CAUSAL,
@@ -564,9 +612,14 @@ def _bwd_kernel(
             DO, DQ, DK, DV,
             LSE, D,
             softmax_scale,
+            dropout_p,
+            dropout_seed,
+            dropout_seq_offset,
+            off_hb,
             stride_qm, stride_kn, stride_vn, stride_bm,
             stride_dom, stride_dqm, stride_dkn, stride_dvn,
             seqlen_q, seqlen_k, headdim,
+            USE_DROPOUT=dropout_p > 0.0,
             ATOMIC_ADD=True,
             BIAS_TYPE=BIAS_TYPE,
             IS_CAUSAL=IS_CAUSAL,
@@ -576,7 +629,7 @@ def _bwd_kernel(
         )
 
 
-def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax_scale=None):
     # shape constraints
     batch, seqlen_q, nheads, d = q.shape
     _, seqlen_k, _, _ = k.shape
@@ -615,10 +668,16 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
     BLOCK = 128
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
+
+    seed, rng_offset = increment_philox_state(batch * nheads * seqlen_q * seqlen_k)
+
     _fwd_kernel[grid](
         q, k, v, bias, o,
         lse, tmp,
         softmax_scale,
+        dropout_p,
+        seed,  # dropout_seed
+        rng_offset,  # dropout seq offset
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -628,15 +687,16 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, softmax_scale=None):
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
+        dropout_p > 0.0,
         bias_type, causal, BLOCK_HEADDIM,
         BLOCK_M=BLOCK, BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=1,
     )
-    return o, lse, softmax_scale  # softmax_scale could have been updated
+    return o, lse, softmax_scale, seed, rng_offset  # softmax_scale could have been updated
 
 
-def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, softmax_scale=None):
+def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, dropout_p=0.0, dropout_seed=None, dropout_seq_offset=None, softmax_scale=None):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
@@ -691,6 +751,9 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         do, dq_accum, dk, dv,
         lse, delta,
         softmax_scale,
+        dropout_p,
+        dropout_seed,
+        dropout_seq_offset,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -701,6 +764,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         dv.stride(0), dv.stride(2), dv.stride(1),
         nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
+        dropout_p > 0.0,
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         bias_type, causal, BLOCK_HEADDIM,
@@ -710,6 +774,75 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         # num_stages=1,
     )
     dq.copy_(dq_accum)
+
+
+def increment_philox_state(increment: int) -> tuple:
+    # view rng_state tensor as uint64. importantly, this keeps the same underlying storage
+    # we:
+    #   1. extract the current rng seed and offset
+    #   2. increment the offset
+    #   3. then set the new state
+    # layout of state tensor is as follows:
+    # [states (200 * 4bytes), seed (uint64_t - 8 bytes), offset (uint64_t - 8 bytes)]
+    # see https://github.com/pytorch/pytorch/blob/9fe050f39c08453b106d0bfc2258e5e34012f522/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
+    rng_state = torch.random.get_rng_state()
+    rng_state_array = rng_state.numpy().view(dtype=np.uint64)
+    states_size = 400
+
+    seed = rng_state_array[states_size]
+    offset = rng_state_array[states_size + 1]
+
+    # increment offset
+    rng_state_array[states_size + 1] += increment
+
+    torch.random.set_rng_state(rng_state)
+
+    return int(seed), int(offset)
+
+
+@triton.jit
+def _rand_uniform_kernel(
+        tensor,
+        seqlen_q,
+        seqlen_k,
+        seed,
+        rng_seq_offset,
+        BLOCK_M: tl.constexpr,
+        BLOCK_N: tl.constexpr
+):
+    start_m_block = tl.program_id(0)
+    hb = tl.program_id(1)
+
+    offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
+    for start_n in range(0, seqlen_k, BLOCK_N):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+
+        stride_m = seqlen_k
+        indices = (hb * seqlen_q * seqlen_k) + (offs_m[:, None] * stride_m) + offs_n[None, :]
+        rand = tl.rand(seed, rng_seq_offset + indices)
+        tl.store(
+            tensor + indices,
+            rand,
+            mask=(offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+        )
+
+
+def rand_uniform(
+        batch_sz: int,
+        n_heads: int,
+        seqlen_q: int,
+        seqlen_k: int,
+        dtype: torch.dtype,
+        device: torch.device
+) -> torch.Tensor:
+    seed, rng_offset = increment_philox_state(batch_sz * n_heads * seqlen_q * seqlen_k)
+    tensor = torch.empty((batch_sz * n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
+
+    grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
+    BLOCK = 128
+    _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
+
+    return tensor
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):
