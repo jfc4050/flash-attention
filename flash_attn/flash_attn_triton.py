@@ -64,9 +64,9 @@ def _fwd_kernel(
     Q, K, V, Bias, Out,
     Lse, TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     softmax_scale,
-    dropout_p: float,
-    dropout_seed: int,
-    dropout_seq_offset: int,
+    dropout_p,
+    dropout_seed,
+    dropout_seq_offset,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -173,17 +173,6 @@ def _fwd_kernel(
             p = tl.exp(qk * softmax_scale - m_ij[:, None])
         l_ij = tl.sum(p, 1)
 
-        # apply dropout
-        if USE_DROPOUT:
-            # attn matrix has shape (B * H, seqlen_q, seqlen_kv)
-            rng_offsets = \
-                dropout_seq_offset + \
-                (off_hb * seqlen_q * seqlen_k) + \
-                (offs_m[:, None] * seqlen_k) + \
-                (start_n + offs_n[None, :])
-            keep_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
-            p = tl.where(keep_mask, p / (1 - dropout_p), 0.0)
-
         # scale acc_o
         acc_o_scale = tl.exp(m_i - m_ij)
 
@@ -192,6 +181,19 @@ def _fwd_kernel(
         tl.store(t_ptrs, acc_o_scale)
         acc_o_scale = tl.load(t_ptrs)
         acc_o = acc_o * acc_o_scale[:, None]
+
+        # apply dropout
+        if USE_DROPOUT:
+            indices = \
+                (off_hb * seqlen_q * seqlen_k) + \
+                (offs_m * seqlen_k)[:, None] + \
+                (start_n + offs_n)[None, :]
+
+            # attn matrix has shape (B * H, seqlen_q, seqlen_k)
+            rand = tl.rand(dropout_seed, dropout_seq_offset + indices)
+
+            p *= tl.where(rand > dropout_p, 1.0 / (1.0 - dropout_p), 0.0)
+
         # update acc_o
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
@@ -296,9 +298,9 @@ def _bwd_kernel_one_col_block(
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
-    dropout_p: float,
-    dropout_seed: int,
-    dropout_seq_offset: int,
+    dropout_p,
+    dropout_seed,
+    dropout_seq_offset,
     offs_hb,
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
@@ -420,7 +422,7 @@ def _bwd_kernel_one_col_block(
                 (start_m + offs_m[:, None] * seqlen_k) + \
                 (start_n + offs_n[None, :])
             dropout_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
-            zij = dropout_mask.to(p.dtype) / (1 - dropout_p)
+            zij = dropout_mask.to(p.dtype) / (1.0 - dropout_p)
 
             # apply dropout to Pij
             p *= zij
@@ -455,7 +457,8 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
-        dp *= zij
+        if USE_DROPOUT:
+            dp *= zij
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
@@ -671,6 +674,8 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
 
     seed, rng_offset = increment_philox_state(batch * nheads * seqlen_q * seqlen_k)
 
+    # debug_tensor = torch.empty((batch, nheads, seqlen_q, seqlen_k), device=q.device, dtype=torch.float32)
+
     _fwd_kernel[grid](
         q, k, v, bias, o,
         lse, tmp,
@@ -693,6 +698,9 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         num_warps=num_warps,
         num_stages=1,
     )
+    # print("debug tensor")
+    # print(debug_tensor.squeeze())
+
     return o, lse, softmax_scale, seed, rng_offset  # softmax_scale could have been updated
 
 
@@ -777,6 +785,8 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
 
 
 def increment_philox_state(increment: int) -> tuple:
+    # return 0, 0
+
     # view rng_state tensor as uint64. importantly, this keeps the same underlying storage
     # we:
     #   1. extract the current rng seed and offset
@@ -787,7 +797,7 @@ def increment_philox_state(increment: int) -> tuple:
     # see https://github.com/pytorch/pytorch/blob/9fe050f39c08453b106d0bfc2258e5e34012f522/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
     rng_state = torch.random.get_rng_state()
     rng_state_array = rng_state.numpy().view(dtype=np.uint64)
-    states_size = 400
+    states_size = 100
 
     seed = rng_state_array[states_size]
     offset = rng_state_array[states_size + 1]
@@ -811,23 +821,25 @@ def _rand_uniform_kernel(
         BLOCK_N: tl.constexpr
 ):
     start_m_block = tl.program_id(0)
-    hb = tl.program_id(1)
+    off_hb = tl.program_id(1)
 
     offs_m = start_m_block * BLOCK_M + tl.arange(0, BLOCK_M)
-    for start_n in range(0, seqlen_k, BLOCK_N):
-        offs_n = start_n + tl.arange(0, BLOCK_N)
+    offs_n = tl.arange(0, BLOCK_N)
 
-        stride_m = seqlen_k
-        indices = (hb * seqlen_q * seqlen_k) + (offs_m[:, None] * stride_m) + offs_n[None, :]
+    for start_n in range(0, seqlen_k, BLOCK_N):
+        indices = \
+            (off_hb * seqlen_q * seqlen_k) + \
+            (offs_m * seqlen_k)[:, None] + \
+            (start_n + offs_n)[None, :]
         rand = tl.rand(seed, rng_seq_offset + indices)
         tl.store(
             tensor + indices,
             rand,
-            mask=(offs_m[:, None] < seqlen_q) & (offs_n[None, :] < seqlen_k)
+            mask=(offs_m[:, None] < seqlen_q) & ((start_n + offs_n)[None, :] < seqlen_k)
         )
 
 
-def rand_uniform(
+def triton_rand_uniform(
         batch_sz: int,
         n_heads: int,
         seqlen_q: int,
@@ -836,11 +848,13 @@ def rand_uniform(
         device: torch.device
 ) -> torch.Tensor:
     seed, rng_offset = increment_philox_state(batch_sz * n_heads * seqlen_q * seqlen_k)
-    tensor = torch.empty((batch_sz * n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
+    print("rand_uniform: ", seed, rng_offset)
+    tensor = torch.empty((batch_sz, n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
 
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
     BLOCK = 128
     _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
+    print(tensor.squeeze())
 
     return tensor
 
@@ -924,7 +938,7 @@ flash_attn_kvpacked_func = FlashAttnKVPackedFunc.apply
 class FlashAttnFunc(torch.autograd.Function):
 
     @staticmethod
-    def forward(ctx, q, k, v, bias=None, causal=False, softmax_scale=None):
+    def forward(ctx, q, k, v, bias=None, causal=False, dropout_p: float = 0.0, softmax_scale=None):
         """
             q: (batch_size, seqlen_q, nheads, headdim)
             k, v: (batch_size, seqlen_k, nheads, headdim)
@@ -934,11 +948,12 @@ class FlashAttnFunc(torch.autograd.Function):
         """
         # Make sure that the last dimension is contiguous
         q, k, v = [x if x.stride(-1) == 1 else x.contiguous() for x in [q, k, v]]
-        o, lse, ctx.softmax_scale = _flash_attn_forward(
-            q, k, v, bias=bias, causal=causal, softmax_scale=softmax_scale
+        o, lse, ctx.softmax_scale, ctx.dropout_seed, ctx.dropout_offset = _flash_attn_forward(
+            q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, softmax_scale=softmax_scale
         )
         ctx.save_for_backward(q, k, v, o, lse, bias)
         ctx.causal = causal
+        ctx.dropout_p = dropout_p
         return o
 
     @staticmethod
@@ -952,7 +967,12 @@ class FlashAttnFunc(torch.autograd.Function):
             dk = torch.empty_like(k)
             dv = torch.empty_like(v)
             _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv,
-                                 bias=bias, causal=ctx.causal, softmax_scale=ctx.softmax_scale)
+                                 bias=bias,
+                                 causal=ctx.causal,
+                                 dropout_p=ctx.dropout_p,
+                                 dropout_seed=ctx.dropout_seed,
+                                 dropout_seq_offset=ctx.dropout_offset,
+                                 softmax_scale=ctx.softmax_scale)
         return dq, dk, dv, None, None, None
 
 

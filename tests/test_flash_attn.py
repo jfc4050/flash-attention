@@ -13,13 +13,15 @@ from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_split_
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 try:
-    from flash_attn.flash_attn_triton import flash_attn_func
+    from flash_attn.flash_attn_triton import flash_attn_func, triton_rand_uniform
 except (ImportError, AttributeError):  # Older version of Triton doesn't have tl.constexpr
     flash_attn_func = None
 
 
 is_sm75 = torch.cuda.get_device_capability('cuda') == (7, 5)
 is_sm80 = torch.cuda.get_device_capability('cuda') == (8, 0)
+
+torch.set_printoptions(profile="full")
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode='random'):
@@ -164,11 +166,21 @@ def attention_ref(q, k, v, query_padding_mask=None, key_padding_mask=None, dropo
         causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device), 1)
         scores.masked_fill_(causal_mask, float('-inf'))
     attention = torch.softmax(scores, dim=-1)
-    dropout_scaling = 1.0 / (1 - dropout_p)
+    dropout_scaling = 1.0 / (1.0 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
     # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
     if dropout_mask is not None:
+        if not upcast:
+            print("attn (ref)")
+            print(attention.squeeze())
+
         attention_drop = attention.masked_fill(~dropout_mask, 0.0)
+
+        if not upcast:
+            print("dropout_scaling", dropout_scaling)
+            print("dropout_p", dropout_p)
+            print("attn_dropped (ref)")
+            print((attention_drop / (1 - dropout_p)).squeeze())
     else:
         attention_drop = attention
     output = torch.einsum('bhts,bshd->bthd', attention_drop, v * dropout_scaling)
@@ -871,24 +883,28 @@ def test_flash_attn_multigpu():
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
-@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
-# @pytest.mark.parametrize('dtype', [torch.bfloat16])
-@pytest.mark.parametrize('causal', [False, True])
-# @pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
-# @pytest.mark.parametrize('d', [48])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
-@pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
-# @pytest.mark.parametrize('bias_shape', (['1hqk']))
-def test_flash_attn_triton_output(seqlen_q, seqlen_k, d, causal, dtype, bias_shape):
+# @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize('dtype', [torch.bfloat16])
+# @pytest.mark.parametrize('causal', [False, True])
+@pytest.mark.parametrize('causal', [False])
+# @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
+@pytest.mark.parametrize('d', [128])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(8, 8)])
+# @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
+@pytest.mark.parametrize('bias_shape', ([None]))
+@pytest.mark.parametrize('dropout_p', [0.17])
+def test_flash_attn_triton_output(seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = 'cuda'
+    seed = 0
+    batch_size = 1
+    nheads = 1
+
     # set seed
-    torch.random.manual_seed(0)
-    batch_size = 32
-    nheads = 4
+    torch.random.manual_seed(seed)
+
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
     if bias_shape == '1h1k':
@@ -903,10 +919,17 @@ def test_flash_attn_triton_output(seqlen_q, seqlen_k, d, causal, dtype, bias_sha
         bias = None
 
     q, k, v = [x.detach().requires_grad_() for x in [q, k, v]]
-    output = flash_attn_func(q, k, v, bias, causal)
 
-    output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal)
-    output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, upcast=False,
+    torch.random.manual_seed(seed)
+    output = flash_attn_func(q, k, v, bias, causal, dropout_p)
+
+    torch.random.manual_seed(seed)
+    keep_mask = triton_rand_uniform(
+        batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
+    print("keep_mask mean", keep_mask.float().mean())
+
+    output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
+    output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask, upcast=False,
                                        reorder_ops=True)
     print(f'Output max diff: {(output - output_ref).abs().max().item()}')
     print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')
@@ -914,6 +937,7 @@ def test_flash_attn_triton_output(seqlen_q, seqlen_k, d, causal, dtype, bias_sha
     print(f'Pytorch mean diff: {(output_pt - output_ref).abs().mean().item()}')
 
     g = torch.randn_like(output)
+    torch.random.manual_seed(seed)
     dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
     dq_ref, dk_ref, dv_ref, = torch.autograd.grad(output_ref, (q, k, v), g)
     dq_pt, dk_pt, dv_pt, = torch.autograd.grad(output_pt, (q, k, v), g)
