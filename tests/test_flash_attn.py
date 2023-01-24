@@ -1,6 +1,5 @@
 import math
 from functools import partial
-import re
 
 import torch
 import torch.nn.functional as F
@@ -21,9 +20,6 @@ except (ImportError, AttributeError):  # Older version of Triton doesn't have tl
 
 is_sm75 = torch.cuda.get_device_capability('cuda') == (7, 5)
 is_sm80 = torch.cuda.get_device_capability('cuda') == (8, 0)
-
-torch.set_printoptions(profile="full", linewidth=300)
-
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode='random'):
@@ -167,28 +163,12 @@ def attention_ref(q, k, v, query_padding_mask=None, key_padding_mask=None, dropo
     if causal:
         causal_mask = torch.triu(torch.ones(seqlen_q, seqlen_k, dtype=torch.bool, device=q.device), 1)
         scores.masked_fill_(causal_mask, float('-inf'))
-
-    # if upcast:
-    #     scores.register_hook(lambda g: print("Sij.grad\n", g.squeeze()))
-
     attention = torch.softmax(scores, dim=-1)
-    # if upcast:
-    #     attention.register_hook(lambda g: print("Pij.grad:\n", g.squeeze()))
-    dropout_scaling = 1.0 / (1.0 - dropout_p)
+    dropout_scaling = 1.0 / (1 - dropout_p)
     # attention_drop = attention.masked_fill(~dropout_mask, 0.0) * dropout_scaling
     # output = torch.einsum('bhts,bshd->bthd', attention_drop , v)
     if dropout_mask is not None:
-        # if upcast:
-        #     print("attn (ref)")
-        #     print(attention.squeeze())
-
         attention_drop = attention.masked_fill(~dropout_mask, 0.0)
-
-        # if upcast:
-        #     print("dropout_scaling", dropout_scaling)
-        #     print("dropout_p", dropout_p)
-        #     print("attn_dropped (ref)")
-        #     print((attention_drop / (1 - dropout_p)).squeeze())
     else:
         attention_drop = attention
     output = torch.einsum('bhts,bshd->bthd', attention_drop, v * dropout_scaling)
@@ -888,44 +868,29 @@ def test_flash_attn_multigpu():
     assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
-@pytest.fixture()
-def test_device_id(worker_id):
-    """get worker ID when using pytest-xdist to run tests in parallel.
-    this can be used to assign tests to different GPUs"""
-    # return 0
-
-    if worker_id == "master":  # when not using xdist or n_workers == 1
-        return 0
-    else:
-        worker_id = int(re.search(r"gw(\d+)", worker_id).group(1))
-
-        return worker_id % torch.cuda.device_count()
-
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
 @pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])
-# @pytest.mark.parametrize('causal', [False])
+# @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
-# @pytest.mark.parametrize('d', [128])
+# @pytest.mark.parametrize('d', [48])
 @pytest.mark.parametrize('batch_size', [1, 32])
 # @pytest.mark.parametrize('batch_size', [1])
 @pytest.mark.parametrize('nheads', [1, 4, 12])
 # @pytest.mark.parametrize('nheads', [1])
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
-# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(8, 8)])
+# @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
-# @pytest.mark.parametrize('bias_shape', ([None]))
+# @pytest.mark.parametrize('bias_shape', (['1hqk']))
 @pytest.mark.parametrize('dropout_p,seed', [(0.0, 0), (0.17, 0), (0.17, 123)])
 # @pytest.mark.parametrize('dropout_p,seed', [(0.17, 0)])
-def test_flash_attn_triton_output(test_device_id, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
+def test_flash_attn_triton_output(batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
-    device = f"cuda:{test_device_id}"
-    print(device)
-
+    device = 'cuda'
     # set seed
     torch.random.manual_seed(seed)
 
@@ -950,7 +915,6 @@ def test_flash_attn_triton_output(test_device_id, batch_size, nheads, seqlen_q, 
     torch.random.manual_seed(seed)
     keep_mask = triton_rand_uniform(
         batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
-    print("keep_mask mean", keep_mask.float().mean())
 
     output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
     output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask, upcast=False,

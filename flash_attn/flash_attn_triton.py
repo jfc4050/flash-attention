@@ -293,8 +293,6 @@ def _bwd_store_dk_dv(
 
 @triton.jit
 def _bwd_kernel_one_col_block(
-    debug_tensor1,
-    debug_tensor2,
     start_n,
     Q, K, V, Bias,
     DO, DQ, DK, DV,
@@ -547,8 +545,6 @@ def init_to_zero(name):
 )
 @triton.jit
 def _bwd_kernel(
-    debug_tensor1,
-    debug_tensor2,
     Q, K, V, Bias,
     DO, DQ, DK, DV,
     LSE, D,
@@ -594,8 +590,6 @@ def _bwd_kernel(
         num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
         for start_n in range(0, num_block_n):
             _bwd_kernel_one_col_block(
-                debug_tensor1,
-                debug_tensor2,
                 start_n,
                 Q, K, V, Bias,
                 DO, DQ, DK, DV,
@@ -619,8 +613,6 @@ def _bwd_kernel(
     else:
         start_n = tl.program_id(0)
         _bwd_kernel_one_col_block(
-            debug_tensor1,
-            debug_tensor2,
             start_n,
             Q, K, V, Bias,
             DO, DQ, DK, DV,
@@ -685,8 +677,6 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
 
     seed, rng_offset = increment_philox_state(batch * nheads * seqlen_q * seqlen_k)
 
-    # debug_tensor = torch.empty((batch, nheads, seqlen_q, seqlen_k), device=q.device, dtype=torch.float32)
-
     _fwd_kernel[grid](
         q, k, v, bias, o,
         lse, tmp,
@@ -709,8 +699,6 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         num_warps=num_warps,
         num_stages=1,
     )
-    # print("debug tensor")
-    # print(debug_tensor.squeeze())
 
     return o, lse, softmax_scale, seed, rng_offset  # softmax_scale could have been updated
 
@@ -760,19 +748,12 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
-    # print("dropout_vals", (dropout_p, dropout_seed, dropout_seq_offset))
-
-    debug_tensor1 = torch.empty((batch, nheads, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device)
-    debug_tensor2 = torch.empty((batch, nheads, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device)
-
     # BLOCK_M = 128
     # BLOCK_N = 64
     # num_warps = 4
     grid = lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1,
                     batch * nheads)
     _bwd_kernel[grid](
-        debug_tensor1,
-        debug_tensor2,
         q, k, v, bias,
         do, dq_accum, dk, dv,
         lse, delta,
@@ -800,12 +781,6 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         # num_stages=1,
     )
     dq.copy_(dq_accum)
-
-    # print("debug tensor1 (bwd)")
-    # print(debug_tensor1.squeeze().detach())
-    # print("debug tensor2 (bwd)")
-    # print(debug_tensor2.squeeze().detach())
-
 
 
 def increment_philox_state(increment: int) -> tuple:
@@ -870,13 +845,11 @@ def triton_rand_uniform(
         device: torch.device
 ) -> torch.Tensor:
     seed, rng_offset = increment_philox_state(batch_sz * n_heads * seqlen_q * seqlen_k)
-    # print("rand_uniform: ", seed, rng_offset)
     tensor = torch.empty((batch_sz, n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
 
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
     BLOCK = 128
     _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
-    # print(tensor.squeeze())
 
     return tensor
 
