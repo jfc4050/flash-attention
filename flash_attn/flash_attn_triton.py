@@ -293,6 +293,8 @@ def _bwd_store_dk_dv(
 
 @triton.jit
 def _bwd_kernel_one_col_block(
+    debug_tensor1,
+    debug_tensor2,
     start_n,
     Q, K, V, Bias,
     DO, DQ, DK, DV,
@@ -411,21 +413,19 @@ def _bwd_kernel_one_col_block(
         else:
             p = tl.exp(qk - lse_i[:, None])
 
-        zij = tl.zeros([BLOCK_M, BLOCK_N], dtype=p.dtype)
         if USE_DROPOUT:
             # compute Zij. has values:
             #   1 / (1 - p) with probability 1 - p
             #   0 with probability p
-            rng_offsets = \
-                dropout_seq_offset + \
-                offs_hb * seqlen_q * seqlen_k + \
-                (start_m + offs_m[:, None] * seqlen_k) + \
-                (start_n + offs_n[None, :])
-            dropout_mask = tl.rand(dropout_seed, rng_offsets) > dropout_p
-            zij = dropout_mask.to(p.dtype) / (1.0 - dropout_p)
 
-            # apply dropout to Pij
-            p *= zij
+            indices = \
+                (offs_hb * seqlen_q * seqlen_k) + \
+                (offs_m_curr * seqlen_k)[:, None] + \
+                offs_n[None, :]
+
+            rand = tl.rand(dropout_seed, indices)
+            keep_mask = rand > dropout_p
+            zij = keep_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
@@ -449,7 +449,10 @@ def _bwd_kernel_one_col_block(
         #     else:
         #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
         #                                    & (offs_d[None, :] < headdim), other=0.0)
-        dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+        if USE_DROPOUT:
+            dv += tl.dot((p * zij).to(do.dtype), do, trans_a=True)
+        else:
+            dv += tl.dot(p.to(do.dtype), do, trans_a=True)
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
         # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
@@ -457,14 +460,16 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
-        if USE_DROPOUT:
-            dp *= zij
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
         # compute ds = p * (dp - delta[:, None])
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster
         Di = tl.load(D + offs_m_curr)
+
+        if USE_DROPOUT:
+            dp *= zij
+
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
         ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
@@ -542,13 +547,15 @@ def init_to_zero(name):
 )
 @triton.jit
 def _bwd_kernel(
+    debug_tensor1,
+    debug_tensor2,
     Q, K, V, Bias,
     DO, DQ, DK, DV,
     LSE, D,
     softmax_scale,
-    dropout_p: float,
-    dropout_seed: int,
-    dropout_seq_offset: int,
+    dropout_p,
+    dropout_seed,
+    dropout_seq_offset,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -587,6 +594,8 @@ def _bwd_kernel(
         num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
         for start_n in range(0, num_block_n):
             _bwd_kernel_one_col_block(
+                debug_tensor1,
+                debug_tensor2,
                 start_n,
                 Q, K, V, Bias,
                 DO, DQ, DK, DV,
@@ -610,6 +619,8 @@ def _bwd_kernel(
     else:
         start_n = tl.program_id(0)
         _bwd_kernel_one_col_block(
+            debug_tensor1,
+            debug_tensor2,
             start_n,
             Q, K, V, Bias,
             DO, DQ, DK, DV,
@@ -622,7 +633,7 @@ def _bwd_kernel(
             stride_qm, stride_kn, stride_vn, stride_bm,
             stride_dom, stride_dqm, stride_dkn, stride_dvn,
             seqlen_q, seqlen_k, headdim,
-            USE_DROPOUT=dropout_p > 0.0,
+            USE_DROPOUT=USE_DROPOUT,
             ATOMIC_ADD=True,
             BIAS_TYPE=BIAS_TYPE,
             IS_CAUSAL=IS_CAUSAL,
@@ -749,12 +760,19 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         bias = bias.expand(batch, nheads, seqlen_q, seqlen_k)
     bias_strides = (bias.stride(0), bias.stride(1), bias.stride(2)) if has_bias else (0, 0, 0)
 
+    # print("dropout_vals", (dropout_p, dropout_seed, dropout_seq_offset))
+
+    debug_tensor1 = torch.empty((batch, nheads, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device)
+    debug_tensor2 = torch.empty((batch, nheads, seqlen_q, seqlen_k), dtype=torch.float32, device=q.device)
+
     # BLOCK_M = 128
     # BLOCK_N = 64
     # num_warps = 4
     grid = lambda META: (triton.cdiv(seqlen_k, META["BLOCK_N"]) if META["SEQUENCE_PARALLEL"] else 1,
                     batch * nheads)
     _bwd_kernel[grid](
+        debug_tensor1,
+        debug_tensor2,
         q, k, v, bias,
         do, dq_accum, dk, dv,
         lse, delta,
@@ -783,10 +801,14 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
     )
     dq.copy_(dq_accum)
 
+    # print("debug tensor1 (bwd)")
+    # print(debug_tensor1.squeeze().detach())
+    # print("debug tensor2 (bwd)")
+    # print(debug_tensor2.squeeze().detach())
+
+
 
 def increment_philox_state(increment: int) -> tuple:
-    # return 0, 0
-
     # view rng_state tensor as uint64. importantly, this keeps the same underlying storage
     # we:
     #   1. extract the current rng seed and offset
@@ -848,13 +870,13 @@ def triton_rand_uniform(
         device: torch.device
 ) -> torch.Tensor:
     seed, rng_offset = increment_philox_state(batch_sz * n_heads * seqlen_q * seqlen_k)
-    print("rand_uniform: ", seed, rng_offset)
+    # print("rand_uniform: ", seed, rng_offset)
     tensor = torch.empty((batch_sz, n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
 
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
     BLOCK = 128
     _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
-    print(tensor.squeeze())
+    # print(tensor.squeeze())
 
     return tensor
 
