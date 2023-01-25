@@ -1,5 +1,6 @@
 import math
 from functools import partial
+import re
 
 import torch
 import torch.nn.functional as F
@@ -868,6 +869,18 @@ def test_flash_attn_multigpu():
     assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
+@pytest.fixture
+def gpu_id_for_test(worker_id):
+    if worker_id == "master":
+        gpu_id = 0
+    else:
+        gpu_id = int(re.search(r"gw(\d+)", worker_id).group(1))
+
+    if gpu_id >= torch.cuda.device_count():
+        raise RuntimeError
+
+    return gpu_id
+
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
@@ -877,20 +890,22 @@ def test_flash_attn_multigpu():
 # @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
 # @pytest.mark.parametrize('d', [48])
-@pytest.mark.parametrize('batch_size', [1, 32])
-# @pytest.mark.parametrize('batch_size', [1])
-@pytest.mark.parametrize('nheads', [1, 4, 12])
-# @pytest.mark.parametrize('nheads', [1])
+@pytest.mark.parametrize('batch_size,nheads', [(1, 1), (1, 4), (1, 12), (32, 1), (32, 4)])
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
 # @pytest.mark.parametrize('bias_shape', (['1hqk']))
 @pytest.mark.parametrize('dropout_p,seed', [(0.0, 0), (0.17, 0), (0.17, 123)])
 # @pytest.mark.parametrize('dropout_p,seed', [(0.17, 0)])
-def test_flash_attn_triton_output(batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
+def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
-    device = 'cuda'
+    device = f'cuda:{gpu_id_for_test}'
+
+    device_id_before_test = torch.cuda.current_device()
+
+    torch.cuda.set_device(gpu_id_for_test)  # otherwise triton complains
+
     # set seed
     torch.random.manual_seed(seed)
 
@@ -944,12 +959,18 @@ def test_flash_attn_triton_output(batch_size, nheads, seqlen_q, seqlen_k, d, cau
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
-    assert (output - output_ref).abs().max().item() <= 2 * (output_pt - output_ref).abs().max().item()
-    # assert torch.allclose(output, output_ref, rtol=rtol, atol=atol)
+    mismatched_outputs = []
+    if (output - output_ref).abs().max().item() > 2 * (output_pt - output_ref).abs().max().item():
+        mismatched_outputs.append("out")
+    if (dq - dq_ref).abs().max().item() > 2 * (dq_pt - dq_ref).abs().max().item():
+        mismatched_outputs.append("dQ")
+    if (dk - dk_ref).abs().max().item() > 2 * (dk_pt - dk_ref).abs().max().item():
+        mismatched_outputs.append("dK")
+    if (dv - dv_ref).abs().max().item() > 2 * (dv_pt - dv_ref).abs().max().item():
+        mismatched_outputs.append("dV")
 
-    assert (dq - dq_ref).abs().max().item() <= 2 * (dq_pt - dq_ref).abs().max().item()
-    assert (dk - dk_ref).abs().max().item() <= 2 * (dk_pt - dk_ref).abs().max().item()
-    assert (dv - dv_ref).abs().max().item() <= 2 * (dv_pt - dv_ref).abs().max().item()
+    torch.cuda.set_device(device_id_before_test)
+    assert len(mismatched_outputs) == 0, mismatched_outputs
 
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
