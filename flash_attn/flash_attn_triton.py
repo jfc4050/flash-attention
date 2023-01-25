@@ -421,7 +421,7 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
-            rand = tl.rand(dropout_seed, indices)
+            rand = tl.rand(dropout_seed, dropout_seq_offset + indices)
             keep_mask = rand > dropout_p
             zij = keep_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
 
