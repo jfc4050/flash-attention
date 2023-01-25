@@ -18,9 +18,23 @@ try:
 except (ImportError, AttributeError):  # Older version of Triton doesn't have tl.constexpr
     flash_attn_func = None
 
-
 is_sm75 = torch.cuda.get_device_capability('cuda') == (7, 5)
 is_sm80 = torch.cuda.get_device_capability('cuda') == (8, 0)
+
+worker_id_pattern = re.compile(r"gw(\d+)")
+
+@pytest.fixture
+def gpu_id_for_test(worker_id):
+    if worker_id == "master":
+        gpu_id = 0
+    else:
+        gpu_id = int(re.match(worker_id_pattern, worker_id).group(1))
+
+    if gpu_id >= torch.cuda.device_count():
+        raise RuntimeError
+
+    return gpu_id
+
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode='random'):
@@ -869,28 +883,17 @@ def test_flash_attn_multigpu():
     assert (dqkv - dqkv_ref).abs().max().item() <= 2 * (dqkv_pt - dqkv_ref).abs().max().item()
 
 
-@pytest.fixture
-def gpu_id_for_test(worker_id):
-    if worker_id == "master":
-        gpu_id = 0
-    else:
-        gpu_id = int(re.search(r"gw(\d+)", worker_id).group(1))
-
-    if gpu_id >= torch.cuda.device_count():
-        raise RuntimeError
-
-    return gpu_id
-
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
-@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]))
+@pytest.mark.parametrize('dtype', ([torch.float16] if is_sm75 else [torch.float16, torch.bfloat16]), ids=str)
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
 @pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
-# @pytest.mark.parametrize('d', [48])
+# @pytest.mark.parametrize('d', [128])
 @pytest.mark.parametrize('batch_size,nheads', [(1, 1), (1, 4), (1, 12), (32, 1), (32, 4)])
+# @pytest.mark.parametrize('batch_size,nheads', [(1, 4)])
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
@@ -908,6 +911,7 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
 
     # set seed
     torch.random.manual_seed(seed)
+    testing_dropout = dropout_p > 0
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
     k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
@@ -924,38 +928,23 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
 
     q, k, v = [x.detach().requires_grad_() for x in [q, k, v]]
 
-    torch.random.manual_seed(seed)
+    if testing_dropout:
+        torch.random.manual_seed(seed)
     output = flash_attn_func(q, k, v, bias, causal, dropout_p)
 
-    torch.random.manual_seed(seed)
+    if testing_dropout:
+        torch.random.manual_seed(seed)
     keep_mask = triton_rand_uniform(
         batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
 
     output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
     output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask, upcast=False,
                                        reorder_ops=True)
-    print(f'Output max diff: {(output - output_ref).abs().max().item()}')
-    print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')
-    print(f'Pytorch max diff: {(output_pt - output_ref).abs().max().item()}')
-    print(f'Pytorch mean diff: {(output_pt - output_ref).abs().mean().item()}')
 
     g = torch.randn_like(output)
-    torch.random.manual_seed(seed)
     dq, dk, dv = torch.autograd.grad(output, (q, k, v), g)
     dq_ref, dk_ref, dv_ref, = torch.autograd.grad(output_ref, (q, k, v), g)
     dq_pt, dk_pt, dv_pt, = torch.autograd.grad(output_pt, (q, k, v), g)
-    print(f'dQ max diff: {(dq - dq_ref).abs().max().item()}')
-    print(f'dK max diff: {(dk - dk_ref).abs().max().item()}')
-    print(f'dV max diff: {(dv - dv_ref).abs().max().item()}')
-    print(f'dQ mean diff: {(dq - dq_ref).abs().mean().item()}')
-    print(f'dK mean diff: {(dk - dk_ref).abs().mean().item()}')
-    print(f'dV mean diff: {(dv - dv_ref).abs().mean().item()}')
-    print(f'dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}')
-    print(f'dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}')
-    print(f'dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}')
-    print(f'dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}')
-    print(f'dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}')
-    print(f'dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}')
 
     # Check that FlashAttention's numerical error is at most twice the numerical error
     # of a Pytorch implementation.
@@ -969,8 +958,28 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     if (dv - dv_ref).abs().max().item() > 2 * (dv_pt - dv_ref).abs().max().item():
         mismatched_outputs.append("dV")
 
+    failed = len(mismatched_outputs) > 0
+    if failed:
+        print(f'Output max diff: {(output - output_ref).abs().max().item()}')
+        print(f'Output mean diff: {(output - output_ref).abs().mean().item()}')
+        print(f'Pytorch max diff: {(output_pt - output_ref).abs().max().item()}')
+        print(f'Pytorch mean diff: {(output_pt - output_ref).abs().mean().item()}')
+
+        print(f'dQ max diff: {(dq - dq_ref).abs().max().item()}')
+        print(f'dK max diff: {(dk - dk_ref).abs().max().item()}')
+        print(f'dV max diff: {(dv - dv_ref).abs().max().item()}')
+        print(f'dQ mean diff: {(dq - dq_ref).abs().mean().item()}')
+        print(f'dK mean diff: {(dk - dk_ref).abs().mean().item()}')
+        print(f'dV mean diff: {(dv - dv_ref).abs().mean().item()}')
+        print(f'dQ Pytorch max diff: {(dq_pt - dq_ref).abs().max().item()}')
+        print(f'dK Pytorch max diff: {(dk_pt - dk_ref).abs().max().item()}')
+        print(f'dV Pytorch max diff: {(dv_pt - dv_ref).abs().max().item()}')
+        print(f'dQ Pytorch mean diff: {(dq_pt - dq_ref).abs().mean().item()}')
+        print(f'dK Pytorch mean diff: {(dk_pt - dk_ref).abs().mean().item()}')
+        print(f'dV Pytorch mean diff: {(dv_pt - dv_ref).abs().mean().item()}')
+
     torch.cuda.set_device(device_id_before_test)
-    assert len(mismatched_outputs) == 0, mismatched_outputs
+    assert not failed, mismatched_outputs
 
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
