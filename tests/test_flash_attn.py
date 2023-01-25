@@ -932,10 +932,11 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
         torch.random.manual_seed(seed)
     output = flash_attn_func(q, k, v, bias, causal, dropout_p)
 
+    keep_mask = None
     if testing_dropout:
         torch.random.manual_seed(seed)
-    keep_mask = triton_rand_uniform(
-        batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
+        keep_mask = triton_rand_uniform(
+            batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
 
     output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
     output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask, upcast=False,
