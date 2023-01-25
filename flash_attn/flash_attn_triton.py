@@ -474,17 +474,33 @@ def _bwd_kernel_one_col_block(
         # compute dk = dot(ds.T, q)
         dk += tl.dot(ds, q, trans_a=True)
         # compute dq
-        if not (EVEN_M & EVEN_HEADDIM):  # Otherewise there's a race condition when BIAS_TYPE='matrix'
-            tl.debug_barrier()
         if not ATOMIC_ADD:
             if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
                 dq = tl.load(dq_ptrs, eviction_policy="evict_last")
                 dq += tl.dot(ds, k)
                 tl.store(dq_ptrs, dq, eviction_policy="evict_last")
             else:
+                # inserted barriers between dQ load to smem tile and
+                # addition of dSij @ Kj to that tile.
+                # maybe the triton compiler isn't properly inserting
+                # __syncthreads() between loads to smem buffer and subsequent
+                # accumulation to the same buffer
+                #
+                # if i rearrange the code to look like this:
+                #
+                #   dq_tmp = tl.dot(ds, k)
+                #   dq = tl.load(...)
+                #   if not (EVEN_M & EVEN_HEADDIM):
+                #       tl.debug_barrier()
+                #   dq += dq_tmp
+                #
+                # it also gets rid of the race conditions which supports the theory,
+                # but not really sure.
                 if EVEN_HEADDIM:
                     dq = tl.load(dq_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0,
                                 eviction_policy="evict_last")
+                    if not (EVEN_M & EVEN_HEADDIM):
+                        tl.debug_barrier()  # otherwise race condition when BIAS_TYPE != 'none'
                     dq += tl.dot(ds, k)
                     tl.store(dq_ptrs, dq, mask=offs_m_curr[:, None] < seqlen_q,
                             eviction_policy="evict_last")
@@ -492,6 +508,8 @@ def _bwd_kernel_one_col_block(
                     dq = tl.load(dq_ptrs,
                                  mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                                  other=0.0, eviction_policy="evict_last")
+                    if not (EVEN_M & EVEN_HEADDIM):
+                        tl.debug_barrier()  # otherwise race condition when BIAS_TYPE != 'none'
                     dq += tl.dot(ds, k)
                     tl.store(dq_ptrs, dq,
                              mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
