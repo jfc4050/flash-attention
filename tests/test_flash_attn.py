@@ -30,11 +30,9 @@ def gpu_id_for_test(worker_id):
     else:
         gpu_id = int(re.match(worker_id_pattern, worker_id).group(1))
 
-    if gpu_id >= torch.cuda.device_count():
-        raise RuntimeError
-
-    return gpu_id
-
+    # assign to GPUs round-robin. be aware that sometimes too many
+    # workers per GPU can result in OOMs
+    return gpu_id % torch.cuda.device_count()
 
 
 def generate_random_padding_mask(max_seqlen, batch_size, device, mode='random'):
