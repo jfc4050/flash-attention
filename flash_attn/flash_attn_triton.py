@@ -448,7 +448,10 @@ def _bwd_kernel_one_col_block(
         #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
         #                                    & (offs_d[None, :] < headdim), other=0.0)
         if USE_DROPOUT:
-            dv += tl.dot((p * zij).to(do.dtype), do, trans_a=True)
+            p_dropped = p * zij
+            if not (EVEN_M & EVEN_N):
+                tl.debug_barrier()
+            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True)
         else:
             dv += tl.dot(p.to(do.dtype), do, trans_a=True)
         # compute dp = dot(v, do)
