@@ -114,7 +114,7 @@ def run_benchmark(
         causal,
         dropout_p,
         repeats=WARMUP_REPS,
-        desc="PyTorch Standard Attention",
+        desc="Standard Attention",
         sub_label=sub_label,
     )
     ref_comparable_results = [m for _, m in ref_benchmark_results]
@@ -125,23 +125,12 @@ def run_benchmark(
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    batch_size = 1
-    nheads = 16
-    seqlen = 128
-    d = 128
-
-    dropout_p = 0.1
-    causal = False
-    dtype = torch.float16
-    device = "cuda"
+    dtype = torch.bfloat16
 
     all_results = []
-    for shape in [(1, 12, 1024, 128), (1, 12, 2048, 128)]:
-        batch_size, nheads, seqlen, d = shape
-
+    for batch_size, nheads, seqlen, d in [(1, 12, 1024, 128), (1, 12, 2048, 128)]:
         for dropout_p in [0.0, 0.1]:
-            for casual in [False, True]:
-
+            for causal in [False, True]:
                 comparable_results = run_benchmark(
                     batch_size=batch_size,
                     n_heads=nheads,
