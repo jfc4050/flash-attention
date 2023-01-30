@@ -805,25 +805,28 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
 
 
 def increment_philox_state(increment: int) -> tuple:
-    # view rng_state tensor as uint64. importantly, this keeps the same underlying storage
-    # we:
-    #   1. extract the current rng seed and offset
-    #   2. increment the offset
-    #   3. then set the new state
-    # layout of state tensor is as follows:
-    # [states (200 * 4bytes), seed (uint64_t - 8 bytes), offset (uint64_t - 8 bytes)]
-    # see https://github.com/pytorch/pytorch/blob/9fe050f39c08453b106d0bfc2258e5e34012f522/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
-    rng_state = torch.random.get_rng_state()
-    rng_state_array = rng_state.numpy().view(dtype=np.uint64)
-    states_size = 100
+    """
+    1. extract the current rng seed and offset
+    2. increment the offset
+    3. then set the new state
 
-    seed = rng_state_array[states_size]
-    offset = rng_state_array[states_size + 1]
+    layout of state tensor is as follows:
+    [states (200 * 4bytes), seed (uint64_t - 8 bytes), offset (uint64_t - 8 bytes)]
+    see https://github.com/pytorch/pytorch/blob/master/aten/src/ATen/cuda/CUDAGeneratorImpl.cpp#L150-L176
+    """
+    rng_state = torch.cuda.get_rng_state()
+    # reinterpret bytes as uint64_t
+    # (not all of the bytes are supposed to be uint64_t but we only care about reading
+    # the last 16 bytes)
+    rng_state_array_as_uint64 = rng_state.numpy().view(dtype=np.uint64)
 
-    # increment offset
-    rng_state_array[states_size + 1] += increment
+    seed = rng_state_array_as_uint64[-2]
+    offset = rng_state_array_as_uint64[-1]
 
-    torch.random.set_rng_state(rng_state)
+    # increment offset (needs to be multiple of 4)
+    rng_state_array_as_uint64[-1] += int(math.ceil(increment / 4)) * 4
+
+    torch.cuda.set_rng_state(rng_state)
 
     return int(seed), int(offset)
 
