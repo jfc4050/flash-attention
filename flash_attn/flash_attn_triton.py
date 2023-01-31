@@ -992,7 +992,7 @@ class FlashAttnFunc(torch.autograd.Function):
                                  dropout_seed=ctx.dropout_seed,
                                  dropout_seq_offset=ctx.dropout_offset,
                                  softmax_scale=ctx.softmax_scale)
-        return dq, dk, dv, None, None, None
+        return dq, dk, dv, None, None, None, None
 
 
 flash_attn_func = FlashAttnFunc.apply
