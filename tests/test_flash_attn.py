@@ -4,6 +4,8 @@ import re
 
 import torch
 import torch.nn.functional as F
+import numpy as np
+from scipy.stats import binomtest
 
 import pytest
 
@@ -979,6 +981,88 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
 
     torch.cuda.set_device(device_id_before_test)
     assert not failed, mismatched_outputs
+
+
+@pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
+@pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (256, 512)])
+@pytest.mark.parametrize('dropout_p,seed', [(0.17, 123), (0.17, 0)])
+def test_flash_attn_triton_dropout_statistics(
+        gpu_id_for_test,
+        seqlen_q,
+        seqlen_k,
+        dropout_p,
+        seed
+):
+    if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
+        pytest.skip()  # Reference implementation OOM
+    device = f'cuda:{gpu_id_for_test}'
+    batch_size = 8
+    nheads = 4
+    dtype = torch.float16
+    d = 128
+
+    device_id_before_test = torch.cuda.current_device()
+    torch.cuda.set_device(gpu_id_for_test)  # otherwise triton complains
+
+    # set seed
+    torch.random.manual_seed(seed)
+
+    n_trials = 500
+
+    # setup inputs
+    q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+    k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
+    q, k, v = [x.detach().requires_grad_() for x in [q, k, v]]
+    bias = None
+    causal = False
+
+    go = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
+
+    try:
+        # binomial test on rand uniform tensors
+        # add up all the "keeps" for each element, then make suure the percentage of keeps
+        # for each element is roughly 1 - dropout_prob
+        torch.random.manual_seed(seed)  # reset RNG offset to 0
+        keep_masks = []
+        for _ in range(n_trials):
+            # will increment RNG offset
+            keep_mask = triton_rand_uniform(
+                batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
+            keep_masks.append(keep_mask.cpu())
+        mask_sum_tensor = sum(mask.numpy() for mask in keep_masks)
+        keep_prob = 1 - dropout_p
+        for keep_sum in np.nditer(mask_sum_tensor):
+            result = binomtest(keep_sum, n_trials, p=keep_prob)
+            assert result.pvalue > 1e-6, f"failed binom test with keep_percentage: {keep_sum / n_trials}, keep_prob: {keep_prob} and p_val: {result.pvalue}"
+
+        # correctness tests using rand uniform tensors
+        torch.random.manual_seed(seed)  # reset RNG offset to 0
+        for keep_mask_idx, keep_mask in enumerate(keep_masks):
+            keep_mask = keep_mask.to(device)
+            # will increment RNG offset
+            output = flash_attn_func(q, k, v, bias, causal, dropout_p)
+            output_ref, _ = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
+
+            dq, dk, dv = torch.autograd.grad(output, (q, k, v), go)
+            dq_ref, dk_ref, dv_ref, = torch.autograd.grad(output_ref, (q, k, v), go)
+
+            to_test = {
+                "out": (output, output_ref),
+                "dQ": (dq, dq_ref),
+                "dK": (dk, dk_ref),
+                "dV": (dv, dv_ref),
+            }
+
+            mismatched = []
+            for name, (val, ref) in to_test.items():
+                if not torch.allclose(val, ref, atol=4e-3, rtol=4e-4):
+                    mismatched.append(name)
+
+            assert len(mismatched) == 0, f"{mismatched} mismatched on {keep_mask_idx}"
+
+    finally:
+        torch.cuda.set_device(device_id_before_test)
 
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
