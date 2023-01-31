@@ -102,6 +102,7 @@ def run_benchmark(
         repeats=WARMUP_REPS,
         desc="FlashAttention",
         sub_label=sub_label,
+        verbose=False,
     )
     triton_comparable_results = [m for _, m in triton_benchmark_results]
 
@@ -116,6 +117,7 @@ def run_benchmark(
         repeats=WARMUP_REPS,
         desc="Standard Attention",
         sub_label=sub_label,
+        verbose=False,
     )
     ref_comparable_results = [m for _, m in ref_benchmark_results]
 
