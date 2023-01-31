@@ -42,6 +42,8 @@ import torch
 import triton
 import triton.language as tl
 
+PHILOX_NUM_ROUNDS = 6
+
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
 # @triton.autotune(
@@ -190,7 +192,7 @@ def _fwd_kernel(
                 (start_n + offs_n)[None, :]
 
             # attn matrix has shape (B * H, seqlen_q, seqlen_k)
-            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices, PHILOX_NUM_ROUNDS)
 
             p *= tl.where(rand > dropout_p, 1.0 / (1.0 - dropout_p), 0.0)
 
@@ -421,7 +423,7 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
-            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices, PHILOX_NUM_ROUNDS)
             keep_mask = rand > dropout_p
             zij = keep_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
 
@@ -852,7 +854,7 @@ def _rand_uniform_kernel(
             (off_hb * seqlen_q * seqlen_k) + \
             (offs_m * seqlen_k)[:, None] + \
             (start_n + offs_n)[None, :]
-        rand = tl.rand(seed, rng_seq_offset + indices)
+        rand = tl.rand(seed, rng_seq_offset + indices, PHILOX_NUM_ROUNDS)
         tl.store(
             tensor + indices,
             rand,
