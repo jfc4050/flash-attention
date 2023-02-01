@@ -69,8 +69,8 @@ def _fwd_kernel(
     Lse, TMP,  # NOTE: TMP is a scratchpad buffer to workaround a compiler bug
     softmax_scale,
     dropout_p,
-    dropout_seed,
-    dropout_seq_offset,
+    rng_seed,
+    rng_offset,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -126,6 +126,9 @@ def _fwd_kernel(
         else:
             q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                         other=0.0)
+
+    dropout_rng_offset_hb = rng_offset.to(off_hb.dtype) + (off_hb * seqlen_q * seqlen_k)
+
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
@@ -189,12 +192,12 @@ def _fwd_kernel(
         # apply dropout
         if USE_DROPOUT:
             indices = \
-                (off_hb * seqlen_q * seqlen_k) + \
+                dropout_rng_offset_hb + \
                 (offs_m * seqlen_k)[:, None] + \
                 (start_n + offs_n)[None, :]
 
             # attn matrix has shape (B * H, seqlen_q, seqlen_k)
-            dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
             p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
@@ -302,9 +305,8 @@ def _bwd_kernel_one_col_block(
     LSE, D,
     softmax_scale,
     dropout_p,
-    dropout_seed,
-    dropout_seq_offset,
-    offs_hb,
+    rng_seed,
+    dropout_rng_offset_hb,
     stride_qm, stride_kn, stride_vn, stride_bm,
     stride_dom, stride_dqm, stride_dkn, stride_dvn,
     seqlen_q, seqlen_k, headdim,
@@ -420,15 +422,14 @@ def _bwd_kernel_one_col_block(
             #   0 with probability p
 
             indices = \
-                (offs_hb * seqlen_q * seqlen_k) + \
+                dropout_rng_offset_hb.to(offs_m_curr.dtype) + \
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
             # don't need to materialize Zij, instead just store dropout bit mask
-            # to save SRAM.
-            # instead the bit mask can be used to simulate
+            # to save SRAM. the bit mask can be used to simulate
             # elementwise multiplication by Zij.
-            dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
@@ -453,6 +454,7 @@ def _bwd_kernel_one_col_block(
         #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
         #                                    & (offs_d[None, :] < headdim), other=0.0)
         if USE_DROPOUT:
+            # Pij_dropped = Pij * Zij
             p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
             dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True)
         else:
@@ -472,6 +474,7 @@ def _bwd_kernel_one_col_block(
         Di = tl.load(D + offs_m_curr)
 
         if USE_DROPOUT:
+            # dPij = dPij_dropped * Zij
             dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
 
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
@@ -574,8 +577,8 @@ def _bwd_kernel(
     LSE, D,
     softmax_scale,
     dropout_p,
-    dropout_seed,
-    dropout_seq_offset,
+    rng_seed,
+    rng_offset,
     stride_qb, stride_qh, stride_qm,
     stride_kb, stride_kh, stride_kn,
     stride_vb, stride_vh, stride_vn,
@@ -610,6 +613,8 @@ def _bwd_kernel(
     # pointer to row-wise quantities in value-like data
     D += off_hb * seqlen_q_rounded
     LSE += off_hb * seqlen_q_rounded
+
+    dropout_rng_offset_hb = rng_offset + (off_hb * seqlen_q * seqlen_k)
     if not SEQUENCE_PARALLEL:
         num_block_n = tl.cdiv(seqlen_k, BLOCK_N)
         for start_n in range(0, num_block_n):
@@ -620,9 +625,8 @@ def _bwd_kernel(
                 LSE, D,
                 softmax_scale,
                 dropout_p,
-                dropout_seed,
-                dropout_seq_offset,
-                off_hb,
+                rng_seed,
+                dropout_rng_offset_hb,
                 stride_qm, stride_kn, stride_vn, stride_bm,
                 stride_dom, stride_dqm, stride_dkn, stride_dvn,
                 seqlen_q, seqlen_k, headdim,
@@ -643,9 +647,8 @@ def _bwd_kernel(
             LSE, D,
             softmax_scale,
             dropout_p,
-            dropout_seed,
-            dropout_seq_offset,
-            off_hb,
+            rng_seed,
+            dropout_rng_offset_hb,
             stride_qm, stride_kn, stride_vn, stride_bm,
             stride_dom, stride_dqm, stride_dkn, stride_dvn,
             seqlen_q, seqlen_k, headdim,
@@ -699,15 +702,15 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
     num_warps = 4 if d <= 64 else 8
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch * nheads)
 
-    seed, rng_offset = increment_philox_state(batch * nheads * seqlen_q * seqlen_k)
+    rng_seed, rng_offset = increment_philox_state(batch * nheads * seqlen_q * seqlen_k)
 
     _fwd_kernel[grid](
         q, k, v, bias, o,
         lse, tmp,
         softmax_scale,
         dropout_p,
-        seed,  # dropout_seed
-        rng_offset,  # dropout seq offset
+        rng_seed,
+        rng_offset,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -717,17 +720,17 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
-        dropout_p > 0.0,
+        dropout_p > 0.0,  # USE_DROPOUT
         bias_type, causal, BLOCK_HEADDIM,
         BLOCK_M=BLOCK, BLOCK_N=BLOCK,
         num_warps=num_warps,
         num_stages=1,
     )
 
-    return o, lse, softmax_scale, seed, rng_offset  # softmax_scale could have been updated
+    return o, lse, softmax_scale, rng_seed, rng_offset  # softmax_scale could have been updated
 
 
-def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, dropout_p=0.0, dropout_seed=None, dropout_seq_offset=None, softmax_scale=None):
+def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=False, dropout_p=0.0, rng_seed=None, rng_offset=None, softmax_scale=None):
     # Make sure that the last dimension is contiguous
     if do.stride(-1) != 1:
         do = do.contiguous()
@@ -783,8 +786,8 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         lse, delta,
         softmax_scale,
         dropout_p,
-        dropout_seed,
-        dropout_seq_offset,
+        rng_seed,
+        rng_offset,
         q.stride(0), q.stride(2), q.stride(1),
         k.stride(0), k.stride(2), k.stride(1),
         v.stride(0), v.stride(2), v.stride(1),
@@ -795,7 +798,7 @@ def _flash_attn_backward(do, q, k, v, o, lse, dq, dk, dv, bias=None, causal=Fals
         dv.stride(0), dv.stride(2), dv.stride(1),
         nheads, seqlen_q, seqlen_k, seqlen_q_rounded, d,
         seqlen_q // 32,  seqlen_k // 32, # key for triton cache (limit number of compilations)
-        dropout_p > 0.0,
+        dropout_p > 0.0,  # USE_DROPOUT
         # Can't use kwargs here because triton autotune expects key to be args, not kwargs
         # IS_CAUSAL=causal, BLOCK_HEADDIM=d,
         bias_type, causal, BLOCK_HEADDIM,
@@ -994,8 +997,8 @@ class FlashAttnFunc(torch.autograd.Function):
                                  bias=bias,
                                  causal=ctx.causal,
                                  dropout_p=ctx.dropout_p,
-                                 dropout_seed=ctx.dropout_seed,
-                                 dropout_seq_offset=ctx.dropout_offset,
+                                 rng_seed=ctx.dropout_seed,
+                                 rng_offset=ctx.dropout_offset,
                                  softmax_scale=ctx.softmax_scale)
         return dq, dk, dv, None, None, None, None
 
