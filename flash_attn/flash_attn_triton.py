@@ -42,6 +42,10 @@ import torch
 import triton
 import triton.language as tl
 
+@triton.jit
+def make_dropout_mask(dropout_p, dropout_seed, indices):
+    return tl.rand(dropout_seed, indices, 6) > dropout_p
+
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
 # @triton.autotune(
@@ -190,9 +194,9 @@ def _fwd_kernel(
                 (start_n + offs_n)[None, :]
 
             # attn matrix has shape (B * H, seqlen_q, seqlen_k)
-            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
 
-            p *= tl.where(rand > dropout_p, 1.0 / (1.0 - dropout_p), 0.0)
+            p *= tl.where(dropout_mask, 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
@@ -421,9 +425,8 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
-            rand = tl.rand(dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
-            keep_mask = rand > dropout_p
-            zij = keep_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
+            dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
+            zij = dropout_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
@@ -832,8 +835,9 @@ def increment_philox_state(increment: int) -> tuple:
 
 
 @triton.jit
-def _rand_uniform_kernel(
+def _dropout_mask_kernel(
         tensor,
+        dropout_p,
         seqlen_q,
         seqlen_k,
         seed,
@@ -852,30 +856,31 @@ def _rand_uniform_kernel(
             (off_hb * seqlen_q * seqlen_k) + \
             (offs_m * seqlen_k)[:, None] + \
             (start_n + offs_n)[None, :]
-        rand = tl.rand(seed, rng_seq_offset + indices)
+        dropout_mask = make_dropout_mask(dropout_p, seed, rng_seq_offset + indices)
         tl.store(
             tensor + indices,
-            rand,
+            dropout_mask,
             mask=(offs_m[:, None] < seqlen_q) & ((start_n + offs_n)[None, :] < seqlen_k)
         )
 
 
-def triton_rand_uniform(
+def triton_dropout_mask(
+        dropout_p: float,
         batch_sz: int,
         n_heads: int,
         seqlen_q: int,
         seqlen_k: int,
-        dtype: torch.dtype,
         device: torch.device
 ) -> torch.Tensor:
     seed, rng_offset = increment_philox_state(batch_sz * n_heads * seqlen_q * seqlen_k)
-    tensor = torch.empty((batch_sz, n_heads, seqlen_q, seqlen_k), dtype=dtype, device=device)
+
+    tensor = torch.empty((batch_sz, n_heads, seqlen_q, seqlen_k), dtype=torch.int32, device=device)
 
     grid = lambda META: (triton.cdiv(seqlen_q, META["BLOCK_M"]), batch_sz * n_heads)
     BLOCK = 128
-    _rand_uniform_kernel[grid](tensor, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
+    _dropout_mask_kernel[grid](tensor, dropout_p, seqlen_q, seqlen_k, seed, rng_offset, BLOCK, BLOCK)
 
-    return tensor
+    return tensor.to(torch.bool)
 
 
 class FlashAttnQKVPackedFunc(torch.autograd.Function):

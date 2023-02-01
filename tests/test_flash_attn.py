@@ -16,7 +16,7 @@ from flash_attn.flash_attn_interface import flash_attn_unpadded_qkvpacked_split_
 from flash_attn.bert_padding import unpad_input, pad_input, index_first_axis
 
 try:
-    from flash_attn.flash_attn_triton import flash_attn_func, triton_rand_uniform
+    from flash_attn.flash_attn_triton import flash_attn_func, triton_dropout_mask
 except (ImportError, AttributeError):  # Older version of Triton doesn't have tl.constexpr
     flash_attn_func = None
 
@@ -935,8 +935,8 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     keep_mask = None
     if testing_dropout:
         torch.random.manual_seed(seed)
-        keep_mask = triton_rand_uniform(
-            batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
+        keep_mask = triton_dropout_mask(
+            dropout_p, batch_size, nheads, seqlen_q, seqlen_k, device=device)
 
     output_ref, attn_ref = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask)
     output_pt, attn_pt = attention_ref(q, k, v, bias=bias, causal=causal, dropout_p=dropout_p, dropout_mask=keep_mask, upcast=False,
@@ -983,7 +983,6 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     assert not failed, mismatched_outputs
 
 
-@pytest.mark.skip("slow")
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
 @pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (256, 512)])
@@ -1025,8 +1024,8 @@ def test_flash_attn_triton_dropout_statistics(
         keep_masks = []
         for _ in range(n_trials):
             # will increment RNG offset
-            keep_mask = triton_rand_uniform(
-                batch_size, nheads, seqlen_q, seqlen_k, dtype=torch.float, device=device) > dropout_p
+            keep_mask = triton_dropout_mask(
+                dropout_p, batch_size, nheads, seqlen_q, seqlen_k, device=device)
             keep_masks.append(keep_mask.cpu())
 
         # binomial test on rand uniform tensors
