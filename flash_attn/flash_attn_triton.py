@@ -195,8 +195,7 @@ def _fwd_kernel(
 
             # attn matrix has shape (B * H, seqlen_q, seqlen_k)
             dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
-
-            p *= tl.where(dropout_mask, 1.0 / (1.0 - dropout_p), 0.0)
+            p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
