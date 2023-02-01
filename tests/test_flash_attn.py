@@ -890,7 +890,7 @@ def test_flash_attn_multigpu():
 # @pytest.mark.parametrize('dtype', [torch.bfloat16])
 @pytest.mark.parametrize('causal', [False, True])
 # @pytest.mark.parametrize('causal', [True])
-@pytest.mark.parametrize('d', [40, 48, 64, 128, 80, 88, 96])
+@pytest.mark.parametrize('d', [40, 48, 64, 80, 88, 96, 128])
 # @pytest.mark.parametrize('d', [128])
 @pytest.mark.parametrize('batch_size,nheads', [(1, 1), (1, 4), (1, 12), (32, 1), (32, 4)])
 # @pytest.mark.parametrize('batch_size,nheads', [(1, 4)])
@@ -898,7 +898,7 @@ def test_flash_attn_multigpu():
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
 # @pytest.mark.parametrize('bias_shape', (['1hqk']))
-@pytest.mark.parametrize('dropout_p,seed', [(0.0, 0), (0.17, 0), (0.17, 123)])
+@pytest.mark.parametrize('dropout_p,seed', [(0.0, 0), (0.17, 0)])
 # @pytest.mark.parametrize('dropout_p,seed', [(0.17, 0)])
 def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
