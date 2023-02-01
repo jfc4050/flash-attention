@@ -416,7 +416,7 @@ def _bwd_kernel_one_col_block(
             p = tl.exp(qk - lse_i[:, None])
 
         if USE_DROPOUT:
-            # compute Zij. has values:
+            # compute Zij (sort of, see below). has values:
             #   1 / (1 - p) with probability 1 - p
             #   0 with probability p
 
@@ -425,8 +425,11 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
+            # don't need to materialize Zij, instead just store dropout bit mask
+            # to save SRAM.
+            # instead the bit mask can be used to simulate
+            # elementwise multiplication by Zij.
             dropout_mask = make_dropout_mask(dropout_p, dropout_seed, dropout_seq_offset.to(indices.dtype) + indices)
-            zij = dropout_mask.to(tl.float32) * (1.0 / (1.0 - dropout_p))
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
@@ -451,9 +454,7 @@ def _bwd_kernel_one_col_block(
         #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
         #                                    & (offs_d[None, :] < headdim), other=0.0)
         if USE_DROPOUT:
-            p_dropped = p * zij
-            if not (EVEN_M & EVEN_N):
-                tl.debug_barrier()
+            p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
             dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True)
         else:
             dv += tl.dot(p.to(do.dtype), do, trans_a=True)
@@ -472,7 +473,7 @@ def _bwd_kernel_one_col_block(
         Di = tl.load(D + offs_m_curr)
 
         if USE_DROPOUT:
-            dp *= zij
+            dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
 
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
