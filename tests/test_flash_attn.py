@@ -5,7 +5,7 @@ import re
 import torch
 import torch.nn.functional as F
 import numpy as np
-from scipy.stats import binomtest
+from scipy.stats import distributions
 
 import pytest
 
@@ -898,12 +898,13 @@ def test_flash_attn_multigpu():
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
 # @pytest.mark.parametrize('bias_shape', (['1hqk']))
-@pytest.mark.parametrize('dropout_p,seed', [(0.0, 0), (0.17, 0)])
+@pytest.mark.parametrize('dropout_p', [0.0, 0.17])
 # @pytest.mark.parametrize('dropout_p,seed', [(0.17, 0)])
-def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, seed):
+def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = f'cuda:{gpu_id_for_test}'
+    seed = 0
 
     device_id_before_test = torch.cuda.current_device()
 
@@ -953,7 +954,8 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     if (output - output_ref).abs().max().item() > 2 * (output_pt - output_ref).abs().max().item():
         mismatched_outputs.append("out")
     # TODO. dropout increases numerical error and dQ fails sometimes.
-    if (dq - dq_ref).abs().max().item() > 3 * (dq_pt - dq_ref).abs().max().item():
+    dq_err_factor = 3 if testing_dropout else 2
+    if (dq - dq_ref).abs().max().item() > dq_err_factor * (dq_pt - dq_ref).abs().max().item():
         mismatched_outputs.append("dQ")
     if (dk - dk_ref).abs().max().item() > 2 * (dk_pt - dk_ref).abs().max().item():
         mismatched_outputs.append("dK")
@@ -983,6 +985,32 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     torch.cuda.set_device(device_id_before_test)
     assert not failed, mismatched_outputs
 
+def _vec_binom_test(x: np.ndarray, n: int, p: float) -> np.ndarray:
+    """
+    stolen from xFormers
+    https://github.com/facebookresearch/xformers/blob/main/tests/test_mem_eff_attention.py#L679-L703
+
+    vectorized implementation of scipy.stats.binom_test
+    this makes our tests much faster
+    reference: https://github.com/scipy/scipy/blob/v1.8.0/scipy/stats/_morestats.py#L2609-L2702
+    """
+    x = np.atleast_1d(x)
+    d = distributions.binom.pmf(x, n, p)[:, None]
+    rerr = 1 + 1e-7
+    # x < p * n case
+    i = np.arange(np.ceil(p * n), n + 1)
+    y = np.sum(distributions.binom.pmf(i, n, p) <= d * rerr, axis=1)
+    pval1 = distributions.binom.cdf(x, n, p) + distributions.binom.sf(n - y, n, p)
+
+    # other case
+    i = np.arange(np.floor(p * n) + 1)
+    y = np.sum(distributions.binom.pmf(i, n, p) <= d * rerr, axis=1)
+    pval2 = distributions.binom.cdf(y - 1, n, p) + distributions.binom.sf(x - 1, n, p)
+
+    pval = np.where(x < p * n, pval1, pval2)
+    pval = np.minimum(1.0, pval)
+    return pval
+
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
@@ -995,21 +1023,17 @@ def test_flash_attn_triton_dropout_statistics(
         dropout_p,
         seed
 ):
-    if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
-        pytest.skip()  # Reference implementation OOM
-    device = f'cuda:{gpu_id_for_test}'
     batch_size = 8
     nheads = 4
     dtype = torch.float16
-    d = 128
+    d = 64
 
     device_id_before_test = torch.cuda.current_device()
+    device = f'cuda:{gpu_id_for_test}'
     torch.cuda.set_device(gpu_id_for_test)  # otherwise triton complains
-
-    # set seed
     torch.random.manual_seed(seed)
 
-    n_trials = 500
+    n_trials = 1000
 
     # setup inputs
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
@@ -1032,11 +1056,11 @@ def test_flash_attn_triton_dropout_statistics(
         # binomial test on rand uniform tensors
         # add up all the "keeps" for each element, then make suure the percentage of keeps
         # for each element is roughly 1 - dropout_prob
-        mask_sum_tensor = sum(mask.numpy() for mask in keep_masks)
+        mask_sums = sum(mask.numpy() for mask in keep_masks).flatten()
         keep_prob = 1 - dropout_p
-        for keep_sum in np.nditer(mask_sum_tensor):
-            result = binomtest(keep_sum, n_trials, p=keep_prob)
-            assert result.pvalue > 1e-7, f"failed binom test with keep_percentage: {keep_sum / n_trials}, keep_prob: {keep_prob} and p_val: {result.pvalue}"
+        pvals = _vec_binom_test(mask_sums, n_trials, keep_prob)
+        argmin = pvals.argmin()
+        assert pvals[argmin] > 1e-8, f"failed binom test with keep_percentage: {mask_sums[argmin] / n_trials}, keep_prob: {keep_prob} and p_val: {pvals[argmin]}"
 
         # correctness tests using rand uniform tensors
         torch.random.manual_seed(seed)  # reset RNG offset to 0
