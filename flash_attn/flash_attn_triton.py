@@ -44,7 +44,7 @@ import triton.language as tl
 
 @triton.jit
 def make_dropout_mask(dropout_p, dropout_seed, indices):
-    return tl.rand(dropout_seed, indices, 6) > dropout_p
+    return tl.rand(dropout_seed, indices, 5) > dropout_p
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
