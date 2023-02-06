@@ -1026,7 +1026,7 @@ def test_flash_attn_triton_dropout_statistics(
     batch_size = 8
     nheads = 4
     dtype = torch.float16
-    d = 64
+    d = 128
 
     device_id_before_test = torch.cuda.current_device()
     device = f'cuda:{gpu_id_for_test}'
