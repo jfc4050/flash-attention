@@ -51,6 +51,7 @@ def run_benchmark(
     n_heads: int,
     seq_len: int,
     head_dim: int,
+    bias_shape: tuple,
     causal: bool,
     dropout_p: float,
     dtype: torch.dtype,
@@ -77,14 +78,14 @@ def run_benchmark(
         dtype=dtype,
     )
     bias = torch.randn(
-        (batch_size, n_heads, seq_len, seq_len),
+        bias_shape,
         requires_grad=False,
         device=device,
         dtype=dtype,
     )
 
     # run benchmarks
-    sub_label = f"({batch_size}, {n_heads}, {seq_len}, {head_dim}), p={dropout_p}, causal={causal}, dtype={dtype}"
+    sub_label = f"({batch_size}, {n_heads}, {seq_len}, {head_dim}), p={dropout_p}, bias={bias_shape}, causal={causal}, dtype={dtype}"
     triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
         q, k, v, bias, causal, dropout_p
     )
@@ -130,19 +131,21 @@ if __name__ == "__main__":
     dtype = torch.bfloat16
 
     all_results = []
-    for batch_size, nheads, seqlen, d in [(1, 12, 1024, 128), (1, 12, 2048, 128)]:
-        for dropout_p in [0.0, 0.1]:
-            for causal in [False, True]:
-                comparable_results = run_benchmark(
-                    batch_size=batch_size,
-                    n_heads=nheads,
-                    seq_len=seqlen,
-                    head_dim=d,
-                    causal=causal,
-                    dropout_p=dropout_p,
-                    dtype=dtype,
-                )
-                all_results.extend(comparable_results)
+    for batch_size, nheads, seqlen, d in [(1, 12, 4096, 128)]:
+        for bias_shape in [(batch_size, 1, 1, seqlen)]:
+            for dropout_p in [0.0, 0.1]:
+                for causal in [False, True]:
+                    comparable_results = run_benchmark(
+                        batch_size=batch_size,
+                        n_heads=nheads,
+                        seq_len=seqlen,
+                        head_dim=d,
+                        bias_shape=bias_shape,
+                        causal=causal,
+                        dropout_p=dropout_p,
+                        dtype=dtype,
+                    )
+                    all_results.extend(comparable_results)
 
     compare = Compare(all_results)
     compare.colorize(rowwise=True)

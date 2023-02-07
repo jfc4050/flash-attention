@@ -332,7 +332,14 @@ def _bwd_kernel_one_col_block(
     do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
     dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
     if BIAS_TYPE == 'vector':
+        # vector bias is same over all values of m, so
+        # can be loaded once and kept in SRAM over all iterations
         b_ptrs = Bias + offs_n
+        if EVEN_N:
+            bias = tl.load(b_ptrs).to(tl.float32)
+        else:
+            bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
+        bias = bias[None, :]
     elif BIAS_TYPE == 'matrix':
         b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
     # initialize dv and dk
@@ -392,11 +399,7 @@ def _bwd_kernel_one_col_block(
         if BIAS_TYPE != 'none':
             tl.debug_barrier()  # Race condition otherwise
             if BIAS_TYPE == 'vector':
-                if EVEN_N:
-                    bias = tl.load(b_ptrs).to(tl.float32)
-                else:
-                    bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
-                bias = bias[None, :]
+                pass  # already loaded before entering loop
             elif BIAS_TYPE == 'matrix':
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
