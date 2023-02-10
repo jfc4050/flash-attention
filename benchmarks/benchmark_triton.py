@@ -3,10 +3,45 @@ import torch
 from torch.utils.benchmark import Compare
 
 from flash_attn.utils.benchmark import benchmark_all
+from flash_attn.flash_attn_interface import flash_attn_unpadded_func
 from flash_attn.flash_attn_triton import flash_attn_func
 
 WARMUP_REPS = 30
 
+
+def attention_cuda(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    v: torch.Tensor,
+    bias: torch.Tensor,
+    causal: bool = False,
+    dropout_p: float = 0.0,
+) -> torch.Tensor:
+    if bias is not None:
+        raise NotImplementedError
+
+    batch_sz, seqlen, nheads, head_dim = q.shape
+
+    cu_seqlens = torch.arange(
+        0,
+        (batch_sz + 1) * seqlen,
+        step=seqlen,
+        dtype=torch.int32,
+        device=q.device
+    )
+    return flash_attn_unpadded_func(
+        q.view(-1, nheads, head_dim),
+        k.view(-1, nheads, head_dim),
+        v.view(-1, nheads, head_dim),
+        cu_seqlens,
+        cu_seqlens,
+        seqlen,
+        seqlen,
+        dropout_p=dropout_p,
+        softmax_scale=None,
+        causal=causal,
+        return_attn_probs=False
+    )
 
 def attention_ref(
     q: torch.Tensor,
@@ -77,19 +112,42 @@ def run_benchmark(
         device=device,
         dtype=dtype,
     )
-    bias = torch.randn(
-        bias_shape,
-        requires_grad=False,
-        device=device,
-        dtype=dtype,
-    )
+    if bias_shape is None:
+        bias = None
+    else:
+        bias = torch.randn(
+            bias_shape,
+            requires_grad=False,
+            device=device,
+            dtype=dtype,
+        )
 
     # run benchmarks
     sub_label = f"({batch_size}, {n_heads}, {seq_len}, {head_dim}), p={dropout_p}, bias={bias_shape}, causal={causal}, dtype={dtype}"
+    results = []
+
+    try:
+        cuda_fn = lambda q, k, v, bias, causal, dropout_p: attention_cuda(
+            q, k, v, bias, causal, dropout_p
+        )
+        cuda_benchmark_results = benchmark_all(
+            cuda_fn,
+            q,
+            k,
+            v,
+            bias,
+            causal,
+            dropout_p,
+            repeats=WARMUP_REPS,
+            desc="Flash (CUDA)",
+            sub_label=sub_label,
+            verbose=False
+        )
+        results.extend([m for _, m in cuda_benchmark_results])
+    except NotImplementedError:
+        pass
+
     triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
-        q, k, v, bias, causal, dropout_p
-    )
-    ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
         q, k, v, bias, causal, dropout_p
     )
     triton_benchmark_results = benchmark_all(
@@ -101,12 +159,15 @@ def run_benchmark(
         causal,
         dropout_p,
         repeats=WARMUP_REPS,
-        desc="FlashAttention",
+        desc="Flash (Triton)",
         sub_label=sub_label,
         verbose=False,
     )
-    triton_comparable_results = [m for _, m in triton_benchmark_results]
+    results.extend([m for _, m in triton_benchmark_results])
 
+    ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
+        q, k, v, bias, causal, dropout_p
+    )
     ref_benchmark_results = benchmark_all(
         ref_fn,
         q,
@@ -120,9 +181,9 @@ def run_benchmark(
         sub_label=sub_label,
         verbose=False,
     )
-    ref_comparable_results = [m for _, m in ref_benchmark_results]
+    results.extend([m for _, m in ref_benchmark_results])
 
-    return triton_comparable_results + ref_comparable_results
+    return results
 
 
 if __name__ == "__main__":
@@ -132,7 +193,7 @@ if __name__ == "__main__":
 
     all_results = []
     for batch_size, nheads, seqlen, d in [(1, 12, 4096, 128)]:
-        for bias_shape in [(batch_size, 1, 1, seqlen)]:
+        for bias_shape in [None, (batch_size, 1, 1, seqlen)]:
             for dropout_p in [0.0, 0.1]:
                 for causal in [False, True]:
                     comparable_results = run_benchmark(
