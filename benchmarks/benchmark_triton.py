@@ -89,9 +89,9 @@ def run_benchmark(
     bias_shape: tuple,
     causal: bool,
     dropout_p: float,
-    dtype: torch.dtype,
 ) -> list:
     device = "cuda"
+    dtype = torch.bfloat16
 
     # setup inputs
     q = torch.randn(
@@ -123,7 +123,7 @@ def run_benchmark(
         )
 
     # run benchmarks
-    sub_label = f"({batch_size}, {n_heads}, {seq_len}, {head_dim}), p={dropout_p}, bias={bias_shape}, causal={causal}, dtype={dtype}"
+    sub_label = f"({batch_size},{n_heads},{seq_len},{head_dim}), p={dropout_p}, bias={bias is not None}, causal={causal}"
     results = []
 
     try:
@@ -189,8 +189,6 @@ def run_benchmark(
 if __name__ == "__main__":
     torch.manual_seed(0)
 
-    dtype = torch.bfloat16
-
     all_results = []
     for batch_size, nheads, seqlen, d in [(1, 12, 4096, 128)]:
         for bias_shape in [None, (batch_size, 1, 1, seqlen)]:
@@ -204,7 +202,6 @@ if __name__ == "__main__":
                         bias_shape=bias_shape,
                         causal=causal,
                         dropout_p=dropout_p,
-                        dtype=dtype,
                     )
                     all_results.extend(comparable_results)
 
