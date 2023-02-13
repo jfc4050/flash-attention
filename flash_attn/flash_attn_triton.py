@@ -321,16 +321,9 @@ def _bwd_kernel_one_col_block(
     # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
     begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
     # initialize row/col offsets
-    offs_qm = begin_m + tl.arange(0, BLOCK_M)
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
-    offs_m = tl.arange(0, BLOCK_M)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     # initialize pointers to value-like data
-    q_ptrs = Q + (offs_qm[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    do_ptrs = DO + (offs_qm[:, None] * stride_dom + offs_d[None, :])
-    dq_ptrs = DQ + (offs_qm[:, None] * stride_dqm + offs_d[None, :])
     if BIAS_TYPE == 'vector':
         # vector bias is same over all values of m, so
         # can be loaded once and kept in SRAM over all iterations
@@ -341,7 +334,7 @@ def _bwd_kernel_one_col_block(
             bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
         bias = bias[None, :]
     elif BIAS_TYPE == 'matrix':
-        b_ptrs = Bias + (offs_qm[:, None] * stride_bm + offs_n[None, :])
+        pass
     # initialize dv and dk
     dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
@@ -358,6 +351,8 @@ def _bwd_kernel_one_col_block(
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
+    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
+    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
             k = tl.load(k_ptrs)
@@ -378,9 +373,11 @@ def _bwd_kernel_one_col_block(
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
-        offs_m_curr = start_m + offs_m
+        offs_m_curr = start_m + tl.arange(0, BLOCK_M)
         # load q, k, v, do on-chip
         # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
+
+        q_ptrs = Q + (offs_m_curr[:, None] * stride_qm + offs_d[None, :])
         if EVEN_M & EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -401,6 +398,7 @@ def _bwd_kernel_one_col_block(
             if BIAS_TYPE == 'vector':
                 pass  # already loaded before entering loop
             elif BIAS_TYPE == 'matrix':
+                b_ptrs = Bias + (offs_m_curr[:, None] * stride_bm + offs_n[None, :])
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
                 else:
@@ -439,6 +437,7 @@ def _bwd_kernel_one_col_block(
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
         # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
         # the output is correct.
+        do_ptrs = DO + (offs_m_curr[:, None] * stride_dom + offs_d[None, :])
         if EVEN_M & EVEN_HEADDIM:
             do = tl.load(do_ptrs)
         else:
@@ -486,6 +485,7 @@ def _bwd_kernel_one_col_block(
         # compute dk = dot(ds.T, q)
         dk += tl.dot(ds, q, trans_a=True)
         # compute dq
+        dq_ptrs = DQ + (offs_m_curr[:, None] * stride_dqm + offs_d[None, :])
         if not ATOMIC_ADD:
             if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
                 dq = tl.load(dq_ptrs, eviction_policy="evict_last")
@@ -536,12 +536,6 @@ def _bwd_kernel_one_col_block(
                 else:
                     tl.atomic_add(dq_ptrs, dq,
                                   mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
-        # increment pointers
-        dq_ptrs += BLOCK_M * stride_dqm
-        q_ptrs += BLOCK_M * stride_qm
-        do_ptrs += BLOCK_M * stride_dom
-        if BIAS_TYPE == 'matrix':
-            b_ptrs += BLOCK_M * stride_bm
     # write-back
     dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
     dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
@@ -558,7 +552,7 @@ def init_to_zero(name):
         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         triton.Config({"BLOCK_M": 128, "BLOCK_N": 128, "SEQUENCE_PARALLEL": True}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
         # TODO. THIS CONFIG BEING ENABLED CAUSES BUGS WHEN BLOCK_HEADDIM != 128
-        triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
+        # triton.Config({"BLOCK_M": 64, "BLOCK_N": 64, "SEQUENCE_PARALLEL": True}, num_warps=4, num_stages=1, pre_hook=init_to_zero('DQ')),
         # Other configs seem to give wrong results when seqlen_q % 128 != 0, disabling them for now
         # # Kernel is buggy (give wrong result) if we set BLOCK_m=128, BLOCK_n=64, num_warps=*4*
         # triton.Config({"BLOCK_M": 128, "BLOCK_N": 64, "SEQUENCE_PARALLEL": False}, num_warps=8, num_stages=1, pre_hook=init_to_zero('DQ')),
