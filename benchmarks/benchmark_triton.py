@@ -1,6 +1,7 @@
 import math
 import torch
 from torch.utils.benchmark import Compare
+from benchmarks.attn_fused_softmax import attn_fused_softmax
 
 from flash_attn.utils.benchmark import benchmark_all
 from flash_attn.flash_attn_interface import flash_attn_unpadded_func
@@ -144,44 +145,74 @@ def run_benchmark(
             verbose=False
         )
         results.extend([m for _, m in cuda_benchmark_results])
-    except NotImplementedError:
+    except:
         pass
 
-    triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
-        q, k, v, bias, causal, dropout_p
-    )
-    triton_benchmark_results = benchmark_all(
-        triton_fn,
-        q,
-        k,
-        v,
-        bias,
-        causal,
-        dropout_p,
-        repeats=WARMUP_REPS,
-        desc="Flash (Triton)",
-        sub_label=sub_label,
-        verbose=False,
-    )
-    results.extend([m for _, m in triton_benchmark_results])
+    try:
+        triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
+            q, k, v, bias, causal, dropout_p
+        )
+        triton_benchmark_results = benchmark_all(
+            triton_fn,
+            q,
+            k,
+            v,
+            bias,
+            causal,
+            dropout_p,
+            repeats=WARMUP_REPS,
+            desc="Flash (Triton)",
+            sub_label=sub_label,
+            verbose=False,
+        )
+        results.extend([m for _, m in triton_benchmark_results])
+    except:
+        pass
 
-    ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
-        q, k, v, bias, causal, dropout_p
-    )
-    ref_benchmark_results = benchmark_all(
-        ref_fn,
-        q,
-        k,
-        v,
-        bias,
-        causal,
-        dropout_p,
-        repeats=WARMUP_REPS,
-        desc="Standard Attention",
-        sub_label=sub_label,
-        verbose=False,
-    )
-    results.extend([m for _, m in ref_benchmark_results])
+    # try:
+    #     bhmk_q = q.permute(0, 2, 1, 3)
+    #     bhmk_k = k.permute(0, 2, 1, 3)
+    #     bhmk_v = v.permute(0, 2, 1, 3)
+    #     fused_softmax_fn = lambda q, k, v, bias, causal, dropout_p: attn_fused_softmax(
+    #         bhmk_q, bhmk_k, bhmk_v, bias, causal, dropout_p
+    #     )
+    #     fused_softmax_results = benchmark_all(
+    #         fused_softmax_fn,
+    #         q,
+    #         k,
+    #         v,
+    #         bias,
+    #         causal,
+    #         dropout_p,
+    #         repeats=WARMUP_REPS,
+    #         desc="Fused Softmax Attention",
+    #         sub_label=sub_label,
+    #         verbose=False,
+    #     )
+    #     results.extend([m for _, m in fused_softmax_results])
+    # except:
+    #     pass
+
+    try:
+        ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
+            q, k, v, bias, causal, dropout_p
+        )
+        ref_benchmark_results = benchmark_all(
+            ref_fn,
+            q,
+            k,
+            v,
+            bias,
+            causal,
+            dropout_p,
+            repeats=WARMUP_REPS,
+            desc="Standard Attention",
+            sub_label=sub_label,
+            verbose=False,
+        )
+        results.extend([m for _, m in ref_benchmark_results])
+    except:
+        pass
 
     return results
 
