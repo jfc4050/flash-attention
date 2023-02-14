@@ -94,7 +94,6 @@ def _fwd_kernel(
     # off_hb = off_b * nheads + off_h
     # initialize offsets
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
-    offs_n = tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
     # Initialize pointers to Q, K, V
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
@@ -108,6 +107,8 @@ def _fwd_kernel(
     Lse = Lse + off_hb * seqlen_q_rounded
     if BIAS_TYPE != 'none':
         Bias = Bias + off_b * stride_bb + off_h * stride_bh
+    if USE_DROPOUT:
+        dropout_rng_offset_hb = rng_offset.to(off_hb.dtype) + (off_hb * seqlen_q * seqlen_k)
 
     # initialize pointer to m and l
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
@@ -129,14 +130,13 @@ def _fwd_kernel(
             q = tl.load(q_ptrs, mask=(offs_m[:, None] < seqlen_q) & (offs_d[None, :] < headdim),
                         other=0.0)
 
-    dropout_rng_offset_hb = rng_offset.to(off_hb.dtype) + (off_hb * seqlen_q * seqlen_k)
-
     # loop over k, v and update accumulator
     end_n = seqlen_k if not IS_CAUSAL else tl.minimum((start_m + 1) * BLOCK_M, seqlen_k)
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
+        offs_n_iter = start_n + tl.arange(0, BLOCK_N)
         # -- compute qk ----
-        k_ptrs = K + ((start_n + offs_n)[:, None] * stride_kn + offs_d[None, :])
+        k_ptrs = K + (offs_n_iter[:, None] * stride_kn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
                 k = tl.load(k_ptrs)
@@ -144,34 +144,34 @@ def _fwd_kernel(
                 k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0)
+                k = tl.load(k_ptrs, mask=offs_n_iter[:, None] < seqlen_k, other=0.0)
             else:
                 k = tl.load(k_ptrs,
-                            mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                            mask=(offs_n_iter[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
         qk += tl.dot(q, k, trans_b=True)
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk += tl.where((start_n + offs_n)[None, :] < seqlen_k, 0, float("-inf"))
+            qk += tl.where(offs_n_iter[None, :] < seqlen_k, 0, float("-inf"))
         if IS_CAUSAL:
-            qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
+            qk += tl.where(offs_m[:, None] >= offs_n_iter[None, :], 0, float("-inf"))
         if BIAS_TYPE != 'none':
             if BIAS_TYPE == 'vector':
-                b_ptrs = Bias + start_n + offs_n
+                b_ptrs = Bias + offs_n_iter
                 if EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
                 else:
-                    bias = tl.load(b_ptrs, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
+                    bias = tl.load(b_ptrs, mask=offs_n_iter < seqlen_k, other=0.0).to(tl.float32)
                 bias = bias[None, :]
             elif BIAS_TYPE == 'matrix':
-                b_ptrs = Bias + (offs_m[:, None] * stride_bm + (start_n + offs_n)[None, :])
+                b_ptrs = Bias + (offs_m[:, None] * stride_bm + offs_n_iter[None, :])
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
                 else:
                     bias = tl.load(b_ptrs,
                                    mask=(offs_m[:, None] < seqlen_q)
-                                        & ((start_n + offs_n)[None, :] < seqlen_k),
+                                        & (offs_n_iter[None, :] < seqlen_k),
                                    other=0.0).to(tl.float32)
             # Slightly faster to multiply the softmax_scale in the tl.exp below since the compiler
             # can then fuse the mult and add into an fma instruction. But if we have bias we need to
@@ -196,17 +196,12 @@ def _fwd_kernel(
 
         # apply dropout
         if USE_DROPOUT:
-            indices = \
-                dropout_rng_offset_hb + \
-                (offs_m * seqlen_k)[:, None] + \
-                (start_n + offs_n)[None, :]
-
-            # attn matrix has shape (B * H, seqlen_q, seqlen_k)
+            indices = dropout_rng_offset_hb + (offs_m[:, None] * seqlen_k + offs_n_iter[None, :])
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
             p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
-        v_ptrs = V + ((start_n + offs_n)[:, None] * stride_vn + offs_d[None, :])
+        v_ptrs = V + (offs_n_iter[:, None] * stride_vn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
                 v = tl.load(v_ptrs)
@@ -214,10 +209,10 @@ def _fwd_kernel(
                 v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                v = tl.load(v_ptrs, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_n_iter[:, None] < seqlen_k, other=0.0)
             else:
                 v = tl.load(v_ptrs,
-                            mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
+                            mask=(offs_n_iter[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         p = p.to(v.dtype)
         acc_o += tl.dot(p, v)
