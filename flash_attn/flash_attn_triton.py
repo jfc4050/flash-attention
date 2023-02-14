@@ -337,8 +337,8 @@ def _bwd_kernel_one_col_block(
         pass
     # initialize dv and dk
     if USE_DROPOUT:
-        # use half precision to save SRAM/registers. will result in increased
-        # numerical errors
+        # accumulate dKj and dVj in half precision to save SRAM/registers.
+        # will result in slightly increased numerical error.
         dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DV.dtype.element_ty)
         dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DK.dtype.element_ty)
     else:
