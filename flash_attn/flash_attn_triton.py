@@ -393,12 +393,12 @@ def _bwd_kernel_one_col_block(
                 q = tl.load(q_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
                                          & (offs_d[None, :] < headdim), other=0.0)
         # recompute p = softmax(qk, dim=-1).T
-        qk = tl.dot(q, k, trans_b=True)
+        s = softmax_scale * tl.dot(q, k, trans_b=True)
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
-            qk = tl.where(offs_n[None, :] < seqlen_k, qk, float("-inf"))
+            s = tl.where(offs_n[None, :] < seqlen_k, s, float("-inf"))
         if IS_CAUSAL:
-            qk = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), qk, float("-inf"))
+            s = tl.where(offs_m_curr[:, None] >= (offs_n[None, :]), s, float("-inf"))
         if BIAS_TYPE != 'none':
             tl.debug_barrier()  # Race condition otherwise
             if BIAS_TYPE == 'vector':
@@ -412,16 +412,13 @@ def _bwd_kernel_one_col_block(
                                    mask=(offs_m_curr[:, None] < seqlen_q)
                                         & (offs_n[None, :] < seqlen_k),
                                    other=0.0).to(tl.float32)
-            qk = qk * softmax_scale + bias
+            s += bias
         # There seems to be a race condition when headdim=48/96, and dq, dk, dv are wrong.
         # Also wrong for headdim=64.
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         lse_i = tl.load(LSE + offs_m_curr)
-        if BIAS_TYPE == 'none':
-            p = tl.exp(qk * softmax_scale - lse_i[:, None])
-        else:
-            p = tl.exp(qk - lse_i[:, None])
+        p = tl.exp(s - lse_i[:, None])
 
         if USE_DROPOUT:
             # compute Zij (sort of, see below). has values:
