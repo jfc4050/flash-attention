@@ -336,8 +336,14 @@ def _bwd_kernel_one_col_block(
     elif BIAS_TYPE == 'matrix':
         pass
     # initialize dv and dk
-    dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-    dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+    if USE_DROPOUT:
+        # use half precision to save SRAM/registers. will result in increased
+        # numerical errors
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DV.dtype.element_ty)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DK.dtype.element_ty)
+    else:
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
     # There seems to be some problem with Triton pipelining that makes results wrong for
     # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
     # may have zero step, and pipelining with the bias matrix could screw it up.
@@ -458,9 +464,9 @@ def _bwd_kernel_one_col_block(
         if USE_DROPOUT:
             # Pij_dropped = Pij * Zij
             p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
-            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True)
+            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
         else:
-            dv += tl.dot(p.to(do.dtype), do, trans_a=True)
+            dv += tl.dot(p.to(do.dtype), do, trans_a=True).to(dv.dtype)
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
         # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
@@ -483,7 +489,7 @@ def _bwd_kernel_one_col_block(
         # for BLOCK_HEADDIM=128
         ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
         # compute dk = dot(ds.T, q)
-        dk += tl.dot(ds, q, trans_a=True)
+        dk += tl.dot(ds, q, trans_a=True).to(dk.dtype)
         # compute dq
         dq_ptrs = DQ + (offs_m_curr[:, None] * stride_dqm + offs_d[None, :])
         if not ATOMIC_ADD:
