@@ -100,21 +100,23 @@ def _fwd_kernel(
     # Adding parenthesis around indexing might use int32 math instead of int64 math?
     # https://github.com/openai/triton/issues/741
     # I'm seeing a tiny bit of difference (5-7us)
-    q_ptrs = Q + off_b * stride_qb + off_h * stride_qh + (offs_m[:, None] * stride_qm + offs_d[None, :])
-    k_ptrs = K + off_b * stride_kb + off_h * stride_kh + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + off_b * stride_vb + off_h * stride_vh + (offs_n[:, None] * stride_vn + offs_d[None, :])
-    if BIAS_TYPE == 'vector':
-        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + offs_n
-    elif BIAS_TYPE == 'matrix':
-        b_ptrs = Bias + off_b * stride_bb + off_h * stride_bh + (offs_m[:, None] * stride_bm + offs_n[None, :])
+    Q = Q + off_b * stride_qb + off_h * stride_qh
+    K = K + off_b * stride_kb + off_h * stride_kh
+    V = V + off_b * stride_vb + off_h * stride_vh
+    Out = Out + off_b * stride_ob + off_h * stride_oh
+    TMP = TMP + off_hb * seqlen_q_rounded
+    Lse = Lse + off_hb * seqlen_q_rounded
+    if BIAS_TYPE != 'none':
+        Bias = Bias + off_b * stride_bb + off_h * stride_bh
+
     # initialize pointer to m and l
-    t_ptrs = TMP + off_hb * seqlen_q_rounded + offs_m
     lse_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     m_i = tl.zeros([BLOCK_M], dtype=tl.float32) - float("inf")
     acc_o = tl.zeros([BLOCK_M, BLOCK_HEADDIM], dtype=tl.float32)
     # load q: it will stay in SRAM throughout
     # [2022-10-30] TD: Triton bug - in the case of EVEN_M=True and EVEN_N=False, if we just call
     # tl.load(q_ptrs), we get the wrong output!
+    q_ptrs = Q + (offs_m[:, None] * stride_qm + offs_d[None, :])
     if EVEN_M & EVEN_N:
         if EVEN_HEADDIM:
             q = tl.load(q_ptrs)
@@ -134,17 +136,17 @@ def _fwd_kernel(
     for start_n in range(0, end_n, BLOCK_N):
         start_n = tl.multiple_of(start_n, BLOCK_N)
         # -- compute qk ----
+        k_ptrs = K + ((start_n + offs_n)[:, None] * stride_kn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn)
+                k = tl.load(k_ptrs)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=offs_d[None, :] < headdim, other=0.0)
+                k = tl.load(k_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                k = tl.load(k_ptrs + start_n * stride_kn, mask=(start_n + offs_n)[:, None] < seqlen_k,
-                            other=0.0)
+                k = tl.load(k_ptrs, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0)
             else:
-                k = tl.load(k_ptrs + start_n * stride_kn,
+                k = tl.load(k_ptrs,
                             mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
@@ -156,16 +158,18 @@ def _fwd_kernel(
             qk += tl.where(offs_m[:, None] >= (start_n + offs_n)[None, :], 0, float("-inf"))
         if BIAS_TYPE != 'none':
             if BIAS_TYPE == 'vector':
+                b_ptrs = Bias + start_n + offs_n
                 if EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                    bias = tl.load(b_ptrs).to(tl.float32)
                 else:
-                    bias = tl.load(b_ptrs + start_n, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
+                    bias = tl.load(b_ptrs, mask=(start_n + offs_n) < seqlen_k, other=0.0).to(tl.float32)
                 bias = bias[None, :]
             elif BIAS_TYPE == 'matrix':
+                b_ptrs = Bias + (offs_m[:, None] * stride_bm + (start_n + offs_n)[None, :])
                 if EVEN_M & EVEN_N:
-                    bias = tl.load(b_ptrs + start_n).to(tl.float32)
+                    bias = tl.load(b_ptrs).to(tl.float32)
                 else:
-                    bias = tl.load(b_ptrs + start_n,
+                    bias = tl.load(b_ptrs,
                                    mask=(offs_m[:, None] < seqlen_q)
                                         & ((start_n + offs_n)[None, :] < seqlen_k),
                                    other=0.0).to(tl.float32)
@@ -185,6 +189,7 @@ def _fwd_kernel(
 
         # # -- update output accumulator --
         # BUG: have to store and immediately load
+        t_ptrs = TMP + offs_m
         tl.store(t_ptrs, acc_o_scale)
         acc_o_scale = tl.load(t_ptrs)
         acc_o = acc_o * acc_o_scale[:, None]
@@ -201,17 +206,17 @@ def _fwd_kernel(
             p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
 
         # update acc_o
+        v_ptrs = V + ((start_n + offs_n)[:, None] * stride_vn + offs_d[None, :])
         if EVEN_N & EVEN_M:  # If we just do "if EVEN_N", there seems to be some race condition
             if EVEN_HEADDIM:
-                v = tl.load(v_ptrs + start_n * stride_vn)
+                v = tl.load(v_ptrs)
             else:
-                v = tl.load(v_ptrs + start_n * stride_vn, mask=offs_d[None, :] < headdim, other=0.0)
+                v = tl.load(v_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
         else:
             if EVEN_HEADDIM:
-                v = tl.load(v_ptrs + start_n * stride_vn, mask=(start_n + offs_n)[:, None] < seqlen_k,
-                            other=0.0)
+                v = tl.load(v_ptrs, mask=(start_n + offs_n)[:, None] < seqlen_k, other=0.0)
             else:
-                v = tl.load(v_ptrs + start_n * stride_vn,
+                v = tl.load(v_ptrs,
                             mask=((start_n + offs_n)[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         p = p.to(v.dtype)
@@ -224,6 +229,7 @@ def _fwd_kernel(
 
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
+    t_ptrs = TMP + offs_m
     tl.store(t_ptrs, o_scale)
     o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
@@ -231,11 +237,10 @@ def _fwd_kernel(
     start_m = tl.program_id(0)
     offs_m = start_m * BLOCK_M + tl.arange(0, BLOCK_M)
     # write back l and m
-    lse_ptrs = Lse + off_hb * seqlen_q_rounded + offs_m
-    tl.store(lse_ptrs, lse_i)
+    tl.store(Lse + offs_m, lse_i)
     # initialize pointers to output
     offs_d = tl.arange(0, BLOCK_HEADDIM)
-    out_ptrs = Out + off_b * stride_ob + off_h * stride_oh + (offs_m[:, None] * stride_om + offs_d[None, :])
+    out_ptrs = Out + (offs_m[:, None] * stride_om + offs_d[None, :])
     if EVEN_M:
         if EVEN_HEADDIM:
             tl.store(out_ptrs, acc_o)
@@ -723,7 +728,7 @@ def _flash_attn_forward(q, k, v, bias=None, causal=False, dropout_p=0.0, softmax
         bias_type, causal, BLOCK_HEADDIM,
         BLOCK_M=BLOCK, BLOCK_N=BLOCK,
         num_warps=num_warps,
-        num_stages=1,
+        num_stages=2,
     )
 
     return o, lse, softmax_scale, rng_seed, rng_offset  # softmax_scale could have been updated
