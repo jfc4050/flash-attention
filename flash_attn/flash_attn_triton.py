@@ -323,7 +323,7 @@ def _bwd_kernel_one_col_block(
     # initialize row/col offsets
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
-    # initialize pointers to value-like data
+
     if BIAS_TYPE == 'vector':
         # vector bias is same over all values of m, so
         # can be loaded once and kept in SRAM over all iterations
@@ -335,6 +335,7 @@ def _bwd_kernel_one_col_block(
         bias = bias[None, :]
     elif BIAS_TYPE == 'matrix':
         pass
+
     # initialize dv and dk
     if USE_DROPOUT:
         # accumulate dKj and dVj in half precision to save SRAM/registers.
@@ -344,6 +345,7 @@ def _bwd_kernel_one_col_block(
     else:
         dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
         dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+
     # There seems to be some problem with Triton pipelining that makes results wrong for
     # headdim=64, seqlen=(113, 255), bias_type='matrix'. In this case the for loop
     # may have zero step, and pipelining with the bias matrix could screw it up.
@@ -354,6 +356,7 @@ def _bwd_kernel_one_col_block(
         _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
                          EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
         return
+
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
@@ -375,6 +378,7 @@ def _bwd_kernel_one_col_block(
                         other=0.0)
             v = tl.load(v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                         other=0.0)
+
     # loop over rows
     num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
     for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
@@ -461,9 +465,10 @@ def _bwd_kernel_one_col_block(
         if USE_DROPOUT:
             # Pij_dropped = Pij * Zij
             p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
-            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
         else:
-            dv += tl.dot(p.to(do.dtype), do, trans_a=True).to(dv.dtype)
+            p_dropped = p
+        dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
+
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
         # Also wrong for headdim=128, seqlen=(108, 256), and ATOMIC_ADD=True
@@ -471,16 +476,16 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
+        if USE_DROPOUT:
+            # dPij = dPij_dropped * Zij
+            dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
+
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
             tl.debug_barrier()
         # compute ds = p * (dp - delta[:, None])
         # Putting the subtraction after the dp matmul (instead of before) is slightly faster
         Di = tl.load(D + offs_m_curr)
-
-        if USE_DROPOUT:
-            # dPij = dPij_dropped * Zij
-            dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
 
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
