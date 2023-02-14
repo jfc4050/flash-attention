@@ -396,6 +396,7 @@ def _bwd_kernel_one_col_block(
             else:
                 q = tl.load(q_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
                                          & (offs_d[None, :] < headdim), other=0.0)
+
         # recompute p = softmax(qk, dim=-1).T
         s = softmax_scale * tl.dot(q, k, trans_b=True)
         # Trying to combine the two masks seem to make the result wrong
@@ -439,6 +440,12 @@ def _bwd_kernel_one_col_block(
             # elementwise multiplication by Zij.
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
 
+        if USE_DROPOUT:
+            # Pij_dropped = Pij * Zij
+            p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
+        else:
+            p_dropped = p
+
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
@@ -451,22 +458,7 @@ def _bwd_kernel_one_col_block(
             # [2022-11-01] TD: Triton bug, there's a race condition if we just use m_mask and not d_mask.
             do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
                                         & (offs_d[None, :] < headdim), other=0.0)
-        # if EVEN_M:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0)
-        # else:
-        #     if EVEN_HEADDIM:
-        #         do = tl.load(do_ptrs, mask=offs_m_curr[:, None] < seqlen_q, other=0.0)
-        #     else:
-        #         do = tl.load(do_ptrs, mask=(offs_m_curr[:, None] < seqlen_q)
-        #                                    & (offs_d[None, :] < headdim), other=0.0)
-        if USE_DROPOUT:
-            # Pij_dropped = Pij * Zij
-            p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
-        else:
-            p_dropped = p
+
         dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
 
         # compute dp = dot(v, do)
