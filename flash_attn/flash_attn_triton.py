@@ -198,7 +198,7 @@ def _fwd_kernel(
         if USE_DROPOUT:
             indices = dropout_rng_offset_hb + (offs_m[:, None] * seqlen_k + offs_n_iter[None, :])
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
-            p = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
+            p = tl.where(dropout_mask, p * (1.0 / (1.0 - dropout_p)), 0.0)
 
         # update acc_o
         v_ptrs = V + (offs_n_iter[:, None] * stride_vn + offs_d[None, :])
@@ -442,7 +442,7 @@ def _bwd_kernel_one_col_block(
 
         if USE_DROPOUT:
             # Pij_dropped = Pij * Zij
-            p_dropped = tl.where(dropout_mask, p * 1.0 / (1.0 - dropout_p), 0.0)
+            p_dropped = tl.where(dropout_mask, p * (1.0 / (1.0 - dropout_p)), 0.0)
         else:
             p_dropped = p
 
@@ -470,7 +470,7 @@ def _bwd_kernel_one_col_block(
         dp = tl.dot(do, v, trans_b=True)
         if USE_DROPOUT:
             # dPij = dPij_dropped * Zij
-            dp = tl.where(dropout_mask, dp * 1.0 / (1.0 - dropout_p), 0.0)
+            dp = tl.where(dropout_mask, dp * (1.0 / (1.0 - dropout_p)), 0.0)
 
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
