@@ -351,8 +351,8 @@ def _bwd_kernel_one_col_block(
     # may have zero step, and pipelining with the bias matrix could screw it up.
     # So we just exit early.
     if begin_m >= seqlen_q:
-        dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-        dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+        dv_ptrs = DV + ((offs_n * stride_dvn)[:, None] + offs_d[None, :])
+        dk_ptrs = DK + ((offs_n * stride_dkn)[:, None] + offs_d[None, :])
         _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
                          EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
         return
@@ -360,8 +360,8 @@ def _bwd_kernel_one_col_block(
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
-    k_ptrs = K + (offs_n[:, None] * stride_kn + offs_d[None, :])
-    v_ptrs = V + (offs_n[:, None] * stride_vn + offs_d[None, :])
+    k_ptrs = K + ((offs_n * stride_kn)[:, None] + offs_d[None, :])
+    v_ptrs = V + ((offs_n * stride_vn)[:, None] + offs_d[None, :])
     if EVEN_N & EVEN_M:
         if EVEN_HEADDIM:
             k = tl.load(k_ptrs)
@@ -387,7 +387,7 @@ def _bwd_kernel_one_col_block(
         # load q, k, v, do on-chip
         # Same bug as below. Otherwise gives wrong result for headdim=40, seqlen=(128, 117)
 
-        q_ptrs = Q + (offs_m_curr[:, None] * stride_qm + offs_d[None, :])
+        q_ptrs = Q + (offs_m_curr * stride_qm)[:, None] + offs_d[None, :]
         if EVEN_M & EVEN_HEADDIM:
             q = tl.load(q_ptrs)
         else:
@@ -409,7 +409,7 @@ def _bwd_kernel_one_col_block(
             if BIAS_TYPE == 'vector':
                 pass  # already loaded before entering loop
             elif BIAS_TYPE == 'matrix':
-                b_ptrs = Bias + (offs_m_curr[:, None] * stride_bm + offs_n[None, :])
+                b_ptrs = Bias + (offs_m_curr * stride_bm)[:, None] + offs_n[None, :]
                 if EVEN_M & EVEN_N:
                     bias = tl.load(b_ptrs).to(tl.float32)
                 else:
@@ -445,7 +445,7 @@ def _bwd_kernel_one_col_block(
         # do = tl.load(do_ptrs, mask=offs_d[None, :] < headdim, other=0.0), we get wrong outputs
         # in the case of headdim=48/96, seqlen_q & seqlen_k >= 512. If headdim=40 or seqlen < 512,
         # the output is correct.
-        do_ptrs = DO + (offs_m_curr[:, None] * stride_dom + offs_d[None, :])
+        do_ptrs = DO + (offs_m_curr * stride_dom)[:, None] + offs_d[None, :]
         if EVEN_M & EVEN_HEADDIM:
             do = tl.load(do_ptrs)
         else:
@@ -507,7 +507,7 @@ def _bwd_kernel_one_col_block(
         # compute dk = dot(ds.T, q)
         dk += tl.dot(ds, q, trans_a=True).to(dk.dtype)
         # compute dq
-        dq_ptrs = DQ + (offs_m_curr[:, None] * stride_dqm + offs_d[None, :])
+        dq_ptrs = DQ + (offs_m_curr * stride_dqm)[:, None] + offs_d[None, :]
         if not ATOMIC_ADD:
             if EVEN_M & EVEN_HEADDIM:  # Race condition if we just do EVEN_M
                 dq = tl.load(dq_ptrs, eviction_policy="evict_last")
@@ -559,8 +559,8 @@ def _bwd_kernel_one_col_block(
                     tl.atomic_add(dq_ptrs, dq,
                                   mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
     # write-back
-    dv_ptrs = DV + (offs_n[:, None] * stride_dvn + offs_d[None, :])
-    dk_ptrs = DK + (offs_n[:, None] * stride_dkn + offs_d[None, :])
+    dv_ptrs = DV + (offs_n * stride_dvn)[:, None] + offs_d[None, :]
+    dk_ptrs = DK + (offs_n * stride_dkn)[:, None] + offs_d[None, :]
     _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
                      EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
 
