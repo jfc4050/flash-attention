@@ -1,3 +1,4 @@
+from argparse import ArgumentParser
 import math
 import torch
 from torch.utils.benchmark import Compare
@@ -83,6 +84,7 @@ def attention_ref(
 
 
 def run_benchmark(
+    implementations_to_benchmark: set,
     batch_size: int,
     n_heads: int,
     seq_len: int,
@@ -127,97 +129,111 @@ def run_benchmark(
     sub_label = f"({batch_size},{n_heads},{seq_len},{head_dim}), p={dropout_p}, bias={bias is not None}, causal={causal}"
     results = []
 
-    try:
-        cuda_fn = lambda q, k, v, bias, causal, dropout_p: attention_cuda(
-            q, k, v, bias, causal, dropout_p
-        )
-        cuda_benchmark_results = benchmark_all(
-            cuda_fn,
-            q,
-            k,
-            v,
-            bias,
-            causal,
-            dropout_p,
-            repeats=WARMUP_REPS,
-            desc="Flash (CUDA)",
-            sub_label=sub_label,
-            verbose=False
-        )
-        results.extend([m for _, m in cuda_benchmark_results])
-    except:
-        pass
+    if "cuda" in implementations_to_benchmark:
+        try:
+            cuda_fn = lambda q, k, v, bias, causal, dropout_p: attention_cuda(
+                q, k, v, bias, causal, dropout_p
+            )
+            cuda_benchmark_results = benchmark_all(
+                cuda_fn,
+                q,
+                k,
+                v,
+                bias,
+                causal,
+                dropout_p,
+                repeats=WARMUP_REPS,
+                desc="Flash (CUDA)",
+                sub_label=sub_label,
+                verbose=False
+            )
+            results.extend([m for _, m in cuda_benchmark_results])
+        except:
+            pass
 
-    try:
-        triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
-            q, k, v, bias, causal, dropout_p
-        )
-        triton_benchmark_results = benchmark_all(
-            triton_fn,
-            q,
-            k,
-            v,
-            bias,
-            causal,
-            dropout_p,
-            repeats=WARMUP_REPS,
-            desc="Flash (Triton)",
-            sub_label=sub_label,
-            verbose=False,
-        )
-        results.extend([m for _, m in triton_benchmark_results])
-    except:
-        pass
+    if "triton" in implementations_to_benchmark:
+        try:
+            triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
+                q, k, v, bias, causal, dropout_p
+            )
+            triton_benchmark_results = benchmark_all(
+                triton_fn,
+                q,
+                k,
+                v,
+                bias,
+                causal,
+                dropout_p,
+                repeats=WARMUP_REPS,
+                desc="Flash (Triton)",
+                sub_label=sub_label,
+                verbose=False,
+            )
+            results.extend([m for _, m in triton_benchmark_results])
+        except:
+            pass
 
-    # try:
-    #     bhmk_q = q.permute(0, 2, 1, 3)
-    #     bhmk_k = k.permute(0, 2, 1, 3)
-    #     bhmk_v = v.permute(0, 2, 1, 3)
-    #     fused_softmax_fn = lambda q, k, v, bias, causal, dropout_p: attn_fused_softmax(
-    #         bhmk_q, bhmk_k, bhmk_v, bias, causal, dropout_p
-    #     )
-    #     fused_softmax_results = benchmark_all(
-    #         fused_softmax_fn,
-    #         q,
-    #         k,
-    #         v,
-    #         bias,
-    #         causal,
-    #         dropout_p,
-    #         repeats=WARMUP_REPS,
-    #         desc="Fused Softmax Attention",
-    #         sub_label=sub_label,
-    #         verbose=False,
-    #     )
-    #     results.extend([m for _, m in fused_softmax_results])
-    # except:
-    #     pass
+    if "fused_softmax" in implementations_to_benchmark:
+        try:
+            bhmk_q = q.permute(0, 2, 1, 3)
+            bhmk_k = k.permute(0, 2, 1, 3)
+            bhmk_v = v.permute(0, 2, 1, 3)
+            fused_softmax_fn = lambda q, k, v, bias, causal, dropout_p: attn_fused_softmax(
+                bhmk_q, bhmk_k, bhmk_v, bias, causal, dropout_p
+            )
+            fused_softmax_results = benchmark_all(
+                fused_softmax_fn,
+                q,
+                k,
+                v,
+                bias,
+                causal,
+                dropout_p,
+                repeats=WARMUP_REPS,
+                desc="Fused Softmax Attention",
+                sub_label=sub_label,
+                verbose=False,
+            )
+            results.extend([m for _, m in fused_softmax_results])
+        except:
+            pass
 
-    try:
-        ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
-            q, k, v, bias, causal, dropout_p
-        )
-        ref_benchmark_results = benchmark_all(
-            ref_fn,
-            q,
-            k,
-            v,
-            bias,
-            causal,
-            dropout_p,
-            repeats=WARMUP_REPS,
-            desc="Standard Attention",
-            sub_label=sub_label,
-            verbose=False,
-        )
-        results.extend([m for _, m in ref_benchmark_results])
-    except:
-        pass
+    if "ref" in implementations_to_benchmark:
+        try:
+            ref_fn = lambda q, k, v, bias, causal, dropout_p: attention_ref(
+                q, k, v, bias, causal, dropout_p
+            )
+            ref_benchmark_results = benchmark_all(
+                ref_fn,
+                q,
+                k,
+                v,
+                bias,
+                causal,
+                dropout_p,
+                repeats=WARMUP_REPS,
+                desc="Standard Attention",
+                sub_label=sub_label,
+                verbose=False,
+            )
+            results.extend([m for _, m in ref_benchmark_results])
+        except:
+            pass
 
     return results
 
 
 if __name__ == "__main__":
+    parser = ArgumentParser(__doc__)
+    parser.add_argument("--all", action="store_true")
+    args = parser.parse_args()
+
+    implementations_to_benchmark = {"cuda", "triton", "ref"}
+    if args.all:
+        implementations_to_benchmark = {"cuda", "triton", "fused_softmax", "ref"}
+    else:
+        implementations_to_benchmark = {"cuda", "triton", "ref"}
+
     torch.manual_seed(0)
 
     all_results = []
@@ -226,6 +242,7 @@ if __name__ == "__main__":
             for dropout_p in [0.0, 0.1]:
                 for causal in [False, True]:
                     comparable_results = run_benchmark(
+                        implementations_to_benchmark=implementations_to_benchmark,
                         batch_size=batch_size,
                         n_heads=nheads,
                         seq_len=seqlen,
