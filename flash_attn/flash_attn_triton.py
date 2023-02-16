@@ -435,10 +435,10 @@ def _bwd_kernel_one_col_block(
                 (offs_m_curr * seqlen_k)[:, None] + \
                 offs_n[None, :]
 
-            # don't need to materialize Zij, instead just store dropout bit mask
-            # to save SRAM. the bit mask can be used to simulate
-            # elementwise multiplication by Zij.
+            # don't need to materialize Zij, just store drop bit into sign bit of Pij
+            # (trick stolen from CUDA implementation) to save SRAM/registers
             dropout_mask = make_dropout_mask(dropout_p, rng_seed, indices)
+            p *= tl.where(dropout_mask, 1.0, -1.0)
 
         # compute dv
         # [2022-10-30] TD: A Triton bug: if EVEN_M=True and EVEN_HEADDIM=False, if we call
@@ -466,9 +466,8 @@ def _bwd_kernel_one_col_block(
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
         dp = tl.dot(do, v, trans_b=True)
-        if USE_DROPOUT:
-            # dPij = dPij_dropped * Zij
-            dp *= tl.where(dropout_mask, 1.0 / (1.0 - dropout_p), 0.0)
+        # we don't need to explicitly compute dPij from dPij_dropped, see below where
+        # we compute dSij for more details.
 
         # There's a race condition for headdim=48
         if not EVEN_HEADDIM:
@@ -479,7 +478,32 @@ def _bwd_kernel_one_col_block(
 
         # Converting ds to q.dtype here reduces register pressure and makes it much faster
         # for BLOCK_HEADDIM=128
-        ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
+        if USE_DROPOUT:
+            # for computing dSij = tau * Pij * (dPij - Di)
+            # we have:
+            #   - Pij' which has negative values where Zij = 0, otherwise same as Pij
+            #   - dPij' = dPij_dropped
+            #
+            # IF KEEPING:
+            #   Pij = Pij'
+            #   dPij = dPij'
+            #
+            #   Pij * (dPij - Di) = Pij' * (dPij' - Di)
+            #                     = Pij' * ((dPij' * (1 / (1 - p))) - Di)
+            #
+            # IF DROPPING:
+            #   Pij = -Pij'
+            #   dPij = 0
+            #
+            #   Pij * (dPij - Di) = Pij * (0 - Di)
+            #                     = Pij * -Di
+            #                     = -Pij * Di
+            #                     = Pij' * Di
+            #   note earlier we flipped sign of p if element was to be dropped
+            ds = softmax_scale * p * tl.where(p > 0.0, (dp * (1.0 / (1.0 - dropout_p))) - Di[:, None], Di[:, None])
+            ds = ds.to(q.dtype)
+        else:
+            ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
         # compute dk = dot(ds.T, q)
         dk += tl.dot(ds, q, trans_a=True).to(dk.dtype)
         # compute dq
