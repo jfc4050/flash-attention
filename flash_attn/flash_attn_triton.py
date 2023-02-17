@@ -42,9 +42,19 @@ import torch
 import triton
 import triton.language as tl
 
+
 @triton.jit
 def make_dropout_mask(dropout_p, dropout_seed, indices):
-    return tl.rand(dropout_seed, indices, 3) > dropout_p
+    """integer hashing function rather than using philox PRNG. ends up being a lot faster
+    see http://burtleburtle.net/bob/hash/integer.html
+    """
+    a = indices.to(tl.uint32, bitcast=True)
+    a ^= dropout_seed.to(tl.uint32)  # to introduce dependency on seed
+    a ^= a >> 4
+    a = (a ^ 0xdeadbeef) + (a << 5)
+    a ^= (a >> 11)
+
+    return a > (dropout_p * 4294967295).to(tl.uint32)
 
 
 # Disabling autotune for now, set num_warps=4 if headdim=64 and num_warps=8 if headdim=128
