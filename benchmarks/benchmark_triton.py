@@ -126,7 +126,7 @@ def run_benchmark(
         )
 
     # run benchmarks
-    sub_label = f"({batch_size},{n_heads},{seq_len},{head_dim}), p={dropout_p}, bias={bias is not None}, causal={causal}"
+    sub_label = f"({batch_size},{n_heads},{seq_len},{head_dim}), p={dropout_p}, bias={int(bias is not None)}, causal={int(causal)}"
     results = []
 
     if "cuda" in implementations_to_benchmark:
@@ -143,7 +143,7 @@ def run_benchmark(
                 causal,
                 dropout_p,
                 repeats=WARMUP_REPS,
-                desc="Flash (CUDA)",
+                desc="CUDA",
                 sub_label=sub_label,
                 verbose=False
             )
@@ -164,7 +164,7 @@ def run_benchmark(
             causal,
             dropout_p,
             repeats=WARMUP_REPS,
-            desc="Flash (Triton)",
+            desc="Triton",
             sub_label=sub_label,
             verbose=False,
         )
@@ -209,7 +209,7 @@ def run_benchmark(
                 causal,
                 dropout_p,
                 repeats=WARMUP_REPS,
-                desc="Standard Attention",
+                desc="Ref",
                 sub_label=sub_label,
                 verbose=False,
             )
