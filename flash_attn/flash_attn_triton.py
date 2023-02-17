@@ -318,12 +318,11 @@ def _bwd_kernel_one_col_block(
     EVEN_M: tl.constexpr, EVEN_N: tl.constexpr, EVEN_HEADDIM: tl.constexpr,
     BLOCK_M: tl.constexpr, BLOCK_N: tl.constexpr,
 ):
-    # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
-    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
     # initialize row/col offsets
     offs_n = start_n * BLOCK_N + tl.arange(0, BLOCK_N)
     offs_d = tl.arange(0, BLOCK_HEADDIM)
 
+    # load bias if loop-invariant
     if BIAS_TYPE == 'vector':
         # vector bias is same over all values of m, so
         # can be loaded once and kept in SRAM over all iterations
@@ -333,19 +332,6 @@ def _bwd_kernel_one_col_block(
         else:
             bias = tl.load(b_ptrs, mask=offs_n < seqlen_k, other=0.0).to(tl.float32)
         bias = bias[None, :]
-    elif BIAS_TYPE == 'matrix':
-        pass
-
-    # initialize dv and dk
-    if USE_DROPOUT:
-        # accumulate dKj and dVj in half precision to save SRAM/registers.
-        # will result in slightly increased numerical error.
-        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DV.dtype.element_ty)
-        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DK.dtype.element_ty)
-    else:
-        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
-
     # k and v stay in SRAM throughout
     # [2022-10-30] TD: Same bug as the fwd. In the case of EVEN_N=True and EVEN_M=False,
     # if we just call tl.load(k_ptrs), we get the wrong output!
@@ -368,9 +354,21 @@ def _bwd_kernel_one_col_block(
             v = tl.load(v_ptrs, mask=(offs_n[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                         other=0.0)
 
+    # initialize dv and dk
+    if USE_DROPOUT:
+        # accumulate dKj and dVj in half precision to save SRAM/registers.
+        # will result in slightly increased numerical error.
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DV.dtype.element_ty)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=DK.dtype.element_ty)
+    else:
+        dv = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+        dk = tl.zeros([BLOCK_N, BLOCK_HEADDIM], dtype=tl.float32)
+
     # loop over rows
-    num_block_m = tl.cdiv(seqlen_q, BLOCK_M)
-    for start_m in range(begin_m, num_block_m * BLOCK_M, BLOCK_M):
+    # We need to make sure begin_m is a multiple of BLOCK_M (not BLOCK_N)
+    begin_m = 0 if not IS_CAUSAL else ((start_n * BLOCK_N) // BLOCK_M) * BLOCK_M
+    end_m = tl.cdiv(seqlen_q, BLOCK_M) * BLOCK_M
+    for start_m in range(begin_m, end_m, BLOCK_M):
         start_m = tl.multiple_of(start_m, BLOCK_M)
         offs_m_curr = start_m + tl.arange(0, BLOCK_M)
         # load q, k, v, do on-chip
