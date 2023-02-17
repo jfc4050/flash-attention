@@ -152,26 +152,23 @@ def run_benchmark(
             pass
 
     if "triton" in implementations_to_benchmark:
-        try:
-            triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
-                q, k, v, bias, causal, dropout_p
-            )
-            triton_benchmark_results = benchmark_all(
-                triton_fn,
-                q,
-                k,
-                v,
-                bias,
-                causal,
-                dropout_p,
-                repeats=WARMUP_REPS,
-                desc="Flash (Triton)",
-                sub_label=sub_label,
-                verbose=False,
-            )
-            results.extend([m for _, m in triton_benchmark_results])
-        except:
-            pass
+        triton_fn = lambda q, k, v, bias, causal, dropout_p: flash_attn_func(
+            q, k, v, bias, causal, dropout_p
+        )
+        triton_benchmark_results = benchmark_all(
+            triton_fn,
+            q,
+            k,
+            v,
+            bias,
+            causal,
+            dropout_p,
+            repeats=WARMUP_REPS,
+            desc="Flash (Triton)",
+            sub_label=sub_label,
+            verbose=False,
+        )
+        results.extend([m for _, m in triton_benchmark_results])
 
     if "fused_softmax" in implementations_to_benchmark:
         try:
