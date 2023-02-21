@@ -556,8 +556,8 @@ def _bwd_kernel_one_col_block(
                     tl.atomic_add(dq_ptrs, dq,
                                   mask=(offs_m_curr[:, None] < seqlen_q) & (offs_d[None, :] < headdim))
     # write-back
-    dv_ptrs = DV + (offs_n * stride_dvn)[:, None] + offs_d[None, :]
-    dk_ptrs = DK + (offs_n * stride_dkn)[:, None] + offs_d[None, :]
+    dv_ptrs = DV + ((offs_n * stride_dvn)[:, None] + offs_d[None, :])
+    dk_ptrs = DK + ((offs_n * stride_dkn)[:, None] + offs_d[None, :])
     _bwd_store_dk_dv(dk_ptrs, dv_ptrs, dk, dv, offs_n, offs_d, seqlen_k, headdim,
                      EVEN_M=EVEN_M, EVEN_N=EVEN_N, EVEN_HEADDIM=EVEN_HEADDIM)
 
