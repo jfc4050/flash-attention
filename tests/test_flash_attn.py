@@ -976,29 +976,28 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
 
     failed = len(mismatched_outputs) > 0
     if failed:
-        def report_for_output(name: str, output: torch.Tensor, output_pt: torch.Tensor, output_ref: torch.Tensor) -> None:
+        def report_diff(output_: torch.Tensor, ref_output_: torch.Tensor) -> None:
+            output_ = output_.flatten()
+            ref_output_ = ref_output_.flatten()
 
-            def report_diff(output_: torch.Tensor, ref_output_: torch.Tensor) -> None:
-                output_ = output_.flatten()
-                ref_output_ = ref_output_.flatten()
+            diff = (output_ - ref_output_).abs()
+            diff_argmax = diff.argmax()
 
-                diff = (output_ - ref_output_).abs()
-                diff_argmax = diff.argmax()
+            print(f"  max diff : {diff.max().item()} ({(diff[diff_argmax] / ref_output_[diff_argmax]).abs() * 100:.2f}%)")
+            print(f"  mean diff: {diff.mean().item()}")
 
-                print(f"  max diff : {diff.max().item()} ({(diff[diff_argmax] / ref_output_[diff_argmax]).abs() * 100:.2f}%)")
-                print(f"  mean diff: {diff.mean().item()}")
-
+        for name, flash_result, pt_result, ref_result in [
+            ("O", output, output_pt, output_ref),
+            ("dQ", dq, dq_pt, dq_ref),
+            ("dK", dk, dk_pt, dk_ref),
+            ("dV", dv, dv_pt, dv_ref),
+        ]:
             print("\033[1m" + name + "\033[0m")
             print("FlashAttention:")
-            report_diff(output, output_ref)
+            report_diff(flash_result, ref_result)
             print("PyTorch:")
-            report_diff(output_pt, output_ref)
+            report_diff(pt_result, ref_result)
             print()
-
-        report_for_output("O", output, output_pt, output_ref)
-        report_for_output("dQ", dq, dq_pt, dq_ref)
-        report_for_output("dK", dk, dk_pt, dk_ref)
-        report_for_output("dV", dv, dv_pt, dv_ref)
 
     torch.cuda.set_device(device_id_before_test)
     assert not failed, mismatched_outputs
