@@ -1020,7 +1020,7 @@ def _vec_binom_test(x: np.ndarray, n: int, p: float) -> np.ndarray:
 
 @pytest.mark.skipif(flash_attn_func is None, reason='Triton is not installed or is too old')
 @pytest.mark.skipif(not is_sm80, reason='Triton version is only tested on A100')
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (256, 512)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (256, 512), (512, 512)])
 @pytest.mark.parametrize('dropout_p,seed', [(0.17, 123), (0.17, 0)])
 def test_flash_attn_triton_dropout_statistics(
         gpu_id_for_test,

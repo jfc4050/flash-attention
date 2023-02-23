@@ -878,7 +878,7 @@ def _dropout_mask_kernel(
             (off_hb * seqlen_q * seqlen_k) + \
             (offs_m * seqlen_k)[:, None] + \
             (start_n + offs_n)[None, :]
-        dropout_mask = make_dropout_mask(dropout_p, seed, rng_seq_offset + indices)
+        dropout_mask = make_dropout_mask(dropout_p, seed, (rng_seq_offset + indices).to(tl.int32))
         tl.store(
             tensor + indices,
             dropout_mask,
