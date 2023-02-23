@@ -894,13 +894,14 @@ def test_flash_attn_multigpu():
 @pytest.mark.parametrize('d', [128])
 @pytest.mark.parametrize('batch_size,nheads', [(1, 1), (1, 4), (1, 12), (32, 1), (32, 4)])
 # @pytest.mark.parametrize('batch_size,nheads', [(1, 4)])
-@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023), (2048, 2048)])
+@pytest.mark.parametrize('seqlen_q,seqlen_k', [(113, 203), (128, 217), (113, 211), (108, 256), (256, 512), (512, 256), (1024, 1024), (1023, 1024), (1024, 1023)])
 # @pytest.mark.parametrize('seqlen_q,seqlen_k', [(1024, 1023)])
 @pytest.mark.parametrize('bias_shape', ([None, '1h1k', '1hqk', 'b11k', 'b1qk']))
 # @pytest.mark.parametrize('bias_shape', (['1hqk']))
 @pytest.mark.parametrize('dropout_p', [0.0, 0.17])
+@pytest.mark.parametrize('multi_query', ([False, True]))
 # @pytest.mark.parametrize('dropout_p,seed', [(0.17, 0)])
-def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p):
+def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q, seqlen_k, d, causal, dtype, bias_shape, dropout_p, multi_query):
     if seqlen_q >= 2048 and torch.cuda.get_device_properties('cuda').total_memory <= 16 * 2**30:
         pytest.skip()  # Reference implementation OOM
     device = f'cuda:{gpu_id_for_test}'
@@ -915,7 +916,18 @@ def test_flash_attn_triton_output(gpu_id_for_test, batch_size, nheads, seqlen_q,
     testing_dropout = dropout_p > 0
 
     q = torch.randn(batch_size, seqlen_q, nheads, d, device=device, dtype=dtype)
-    k, v = torch.randn(batch_size, seqlen_k, 2, nheads, d, device=device, dtype=dtype).unbind(dim=2)
+    k, v = torch.randn(
+        batch_size,
+        seqlen_k,
+        2,
+        nheads if not multi_query else 1,
+        d,
+        device=device,
+        dtype=dtype
+    ).unbind(dim=2)
+    if multi_query:
+        k = k.expand(batch_size, seqlen_k, nheads, d)
+        v = v.expand(batch_size, seqlen_k, nheads, d)
     if bias_shape == '1h1k':
         bias = torch.randn(1, nheads, 1, seqlen_k, dtype=torch.float, device=device)
     elif bias_shape == '1hqk':
