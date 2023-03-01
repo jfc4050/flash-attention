@@ -29,9 +29,10 @@ v = torch.randn(
 )
 bias = None
 causal = True
+blockmask = torch.randn(seq_len // 128 ,seq_len // 128, requires_grad=False, device=device, dtype=dtype)
 dropout_p = 0.0
 
-out = flash_attn_func(q, k, v, bias, causal, dropout_p)
+out = flash_attn_func(q, k, v, bias, causal, blockmask, dropout_p)
 
 grad_out = torch.rand_like(q)
 out.backward(grad_out)
