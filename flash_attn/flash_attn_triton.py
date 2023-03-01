@@ -160,7 +160,7 @@ def _fwd_kernel(
                             mask=(offs_n_iter[:, None] < seqlen_k) & (offs_d[None, :] < headdim),
                             other=0.0)
         qk = tl.zeros([BLOCK_M, BLOCK_N], dtype=tl.float32)
-        qk += tl.dot(q, k, trans_b=True)
+        qk += tl.dot(q, tl.trans(k))
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             qk += tl.where(offs_n_iter[None, :] < seqlen_k, 0, float("-inf"))
@@ -199,9 +199,9 @@ def _fwd_kernel(
 
         # # -- update output accumulator --
         # BUG: have to store and immediately load
-        t_ptrs = TMP + offs_m
-        tl.store(t_ptrs, acc_o_scale)
-        acc_o_scale = tl.load(t_ptrs)
+        # t_ptrs = TMP + offs_m
+        # tl.store(t_ptrs, acc_o_scale)
+        # acc_o_scale = tl.load(t_ptrs)
         acc_o = acc_o * acc_o_scale[:, None]
 
         # apply dropout
@@ -234,9 +234,9 @@ def _fwd_kernel(
 
     o_scale = tl.exp(m_i - lse_i)
     # BUG: have to store and immediately load
-    t_ptrs = TMP + offs_m
-    tl.store(t_ptrs, o_scale)
-    o_scale = tl.load(t_ptrs)
+    # t_ptrs = TMP + offs_m
+    # tl.store(t_ptrs, o_scale)
+    # o_scale = tl.load(t_ptrs)
     acc_o = acc_o * o_scale[:, None]
     # rematerialize offsets to save registers
     start_m = tl.program_id(0)
@@ -395,7 +395,7 @@ def _bwd_kernel_one_col_block(
                                          & (offs_d[None, :] < headdim), other=0.0)
 
         # recompute p = softmax(qk, dim=-1).T
-        s = softmax_scale * tl.dot(q, k, trans_b=True)
+        s = softmax_scale * tl.dot(q, tl.trans(k))
         # Trying to combine the two masks seem to make the result wrong
         if not EVEN_N:  # Need to mask out otherwise the softmax is wrong
             s = tl.where(offs_n[None, :] < seqlen_k, s, float("-inf"))
@@ -452,9 +452,9 @@ def _bwd_kernel_one_col_block(
 
         if USE_DROPOUT:
             p_dropped = tl.where(dropout_mask, p * (1.0 / (1.0 - dropout_p)), 0.0)
-            dv += tl.dot(p_dropped.to(do.dtype), do, trans_a=True).to(dv.dtype)
+            dv += tl.dot(tl.trans(p_dropped.to(do.dtype)), do).to(dv.dtype)
         else:
-            dv += tl.dot(p.to(do.dtype), do, trans_a=True).to(dv.dtype)
+            dv += tl.dot(tl.trans(p.to(do.dtype)), do).to(dv.dtype)
 
         # compute dp = dot(v, do)
         # There seems to be a race condition when headdim=48/96, and dq, dk are wrong.
@@ -462,7 +462,7 @@ def _bwd_kernel_one_col_block(
         # Also wrong for headdim=64, seqlen=(1023, 1024), and ATOMIC_ADD=False
         if not (EVEN_M & EVEN_HEADDIM):
             tl.debug_barrier()
-        dp = tl.dot(do, v, trans_b=True)
+        dp = tl.dot(do, tl.trans(v))
         # we don't need to explicitly compute dPij from dPij_dropped, see below where
         # we compute dSij for more details.
 
@@ -502,7 +502,7 @@ def _bwd_kernel_one_col_block(
         else:
             ds = (p * (dp - Di[:, None]) * softmax_scale).to(q.dtype)
         # compute dk = dot(ds.T, q)
-        dk += tl.dot(ds, q, trans_a=True).to(dk.dtype)
+        dk += tl.dot(tl.trans(ds), q).to(dk.dtype)
         # compute dq
         dq_ptrs = DQ + (offs_m_curr * stride_dqm)[:, None] + offs_d[None, :]
         if not ATOMIC_ADD:
